@@ -44,6 +44,11 @@ on:
         required: false
         default: "true"
         type: string
+      runner_label:
+        description: "Runner label to use (e.g. ubuntu-latest, mm-runner-set)"
+        required: false
+        default: "ubuntu-latest"
+        type: string
     secrets:
       kubeconfig_b64:
         description: "Base64-encoded kubeconfig"
@@ -51,7 +56,7 @@ on:
 
 jobs:
   build:
-    runs-on: mm-runner-set
+    runs-on: ${{ inputs.runner_label }}
     permissions:
       packages: write
       contents: read
@@ -119,7 +124,7 @@ jobs:
   deploy:
     if: ${{ inputs.do_deploy == 'true' && needs.build.outputs.image_exists == 'false' }}
     needs: build
-    runs-on: mm-runner-set
+    runs-on: ${{ inputs.runner_label }}
     steps:
       - name: Checkout repo (manifests only)
         uses: actions/checkout@v4
