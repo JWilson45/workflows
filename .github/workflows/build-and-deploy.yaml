@@ -1,0 +1,140 @@
+name: Reusable Build & Deploy
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: "Full image name (e.g. ghcr.io/org/repo)"
+        required: true
+        type: string
+      app_dir:
+        description: "Path to the app directory (contains package.json & Dockerfile)"
+        required: true
+        type: string
+      dockerfile:
+        description: "Path to Dockerfile (relative to repo root)"
+        required: false
+        default: "${{ inputs.app_dir }}/Dockerfile"
+        type: string
+      platforms:
+        description: "Platforms to build (comma-separated)"
+        required: false
+        default: "linux/amd64"
+        type: string
+      kube_namespace:
+        description: "Kubernetes namespace for deploy"
+        required: false
+        default: "default"
+        type: string
+      kube_deployment:
+        description: "Kubernetes deployment name"
+        required: true
+        type: string
+      kube_container:
+        description: "Container name inside the deployment"
+        required: true
+        type: string
+      sparse_checkout_dir:
+        description: "Path to manifests or deploy dir for sparse checkout"
+        required: false
+        default: "${{ inputs.app_dir }}/deploy"
+        type: string
+      do_deploy:
+        description: "Whether to deploy after build (true/false)"
+        required: false
+        default: "true"
+        type: string
+    secrets:
+      kubeconfig_b64:
+        description: "Base64-encoded kubeconfig"
+        required: true
+
+jobs:
+  build:
+    runs-on: mm-runner-set
+    permissions:
+      packages: write
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      image_exists: ${{ steps.image_exists.outputs.exists }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version from package.json
+        id: version
+        run: |
+          ver=$(jq -r '.version' "${{ inputs.app_dir }}/package.json")
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
+      - name: Check if image version exists in GHCR
+        id: image_exists
+        run: |
+          TAG="${{ steps.version.outputs.version }}"
+          IMAGE_REF="${{ inputs.image_name }}"
+          REGISTRY="$(echo $IMAGE_REF | cut -d'/' -f1)"
+          REPO="$(echo $IMAGE_REF | cut -d'/' -f2-)"
+          FULL_IMAGE="$IMAGE_REF:$TAG"
+          TOKEN=$(curl -s "https://$REGISTRY/token?scope=repository:$REPO:pull" | jq -r .token)
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.oci.image.index.v1+json" \
+            "https://$REGISTRY/v2/$REPO/manifests/$TAG")
+          echo "Got HTTP status: $STATUS"
+          if [ "$STATUS" = "200" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Image $FULL_IMAGE already exists in GHCR. Skipping build and push." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build & push multi-arch image
+        if: steps.image_exists.outputs.exists == 'false'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: |
+            ${{ inputs.image_name }}:${{ steps.version.outputs.version }}
+            ${{ inputs.image_name }}:latest
+
+      - name: Add skip message to workflow summary
+        if: steps.image_exists.outputs.exists == 'true'
+        run: |
+          echo "### Skipped build & push: tag \`${{ steps.version.outputs.version }}\` already exists." >> $GITHUB_STEP_SUMMARY
+
+  deploy:
+    if: ${{ inputs.do_deploy == 'true' && needs.build.outputs.image_exists == 'false' }}
+    needs: build
+    runs-on: mm-runner-set
+    steps:
+      - name: Checkout repo (manifests only)
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            ${{ inputs.sparse_checkout_dir }}
+          sparse-checkout-cone-mode: false
+
+      - name: Install kubectl and load kubeconfig
+        uses: tale/kubectl-action@v1
+        with:
+          base64-kube-config: ${{ secrets.kubeconfig_b64 }}
+
+      - name: Set image tag & apply
+        run: |
+          kubectl set image -n ${{ inputs.kube_namespace }} \
+            deployment/${{ inputs.kube_deployment }} \
+            ${{ inputs.kube_container }}=${{ inputs.image_name }}:${{ needs.build.outputs.version }}
