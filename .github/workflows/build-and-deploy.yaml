@@ -34,11 +34,6 @@ on:
         description: "Container name inside the deployment"
         required: true
         type: string
-      sparse_checkout_dir:
-        description: "Path to manifests or deploy dir for sparse checkout"
-        required: false
-        default: "${{ inputs.app_dir }}/deploy"
-        type: string
       do_deploy:
         description: "Whether to deploy after build (true/false)"
         required: false
@@ -55,14 +50,13 @@ on:
         required: true
 
 jobs:
-  build:
+  build-and-deploy:
     runs-on: ${{ inputs.runner_label }}
     permissions:
       packages: write
       contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
-      image_exists: ${{ steps.image_exists.outputs.exists }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -94,6 +88,11 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Add skip message to workflow summary
+        if: steps.image_exists.outputs.exists == 'true'
+        run: |
+          echo "### Skipped build & push: tag \`${{ steps.version.outputs.version }}\` already exists." >> $GITHUB_STEP_SUMMARY
+
       - name: Set up Docker Buildx
         if: steps.image_exists.outputs.exists == 'false'
         uses: docker/setup-buildx-action@v3
@@ -118,30 +117,33 @@ jobs:
             ${{ inputs.image_name }}:${{ steps.version.outputs.version }}
             ${{ inputs.image_name }}:latest
 
-      - name: Add skip message to workflow summary
-        if: steps.image_exists.outputs.exists == 'true'
+      - name: Create GitHub Release via curl
+        if: steps.image_exists.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "### Skipped build & push: tag \`${{ steps.version.outputs.version }}\` already exists." >> $GITHUB_STEP_SUMMARY
-
-  deploy:
-    if: ${{ inputs.do_deploy == 'true' && needs.build.outputs.image_exists == 'false' }}
-    needs: build
-    runs-on: ${{ inputs.runner_label }}
-    steps:
-      - name: Checkout repo (manifests only)
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: |
-            ${{ inputs.sparse_checkout_dir }}
-          sparse-checkout-cone-mode: false
+          OWNER="${{ github.repository_owner }}"
+          REPO="${{ github.event.repository.name }}"
+          TAG="${{ steps.version.outputs.version }}"
+          curl -s -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$OWNER/$REPO/releases" \
+            -d "$(jq -n \
+              --arg tag "$TAG" \
+              --arg name "Release $TAG" \
+              '{tag_name: $tag, name: $name, draft: false, prerelease: false, generate_release_notes: true}')" \
+          | jq '.html_url'
 
       - name: Install kubectl and load kubeconfig
+        if: ${{ inputs.do_deploy == 'true' && steps.image_exists.outputs.exists == 'false' }}
         uses: tale/kubectl-action@v1
         with:
           base64-kube-config: ${{ secrets.kubeconfig_b64 }}
 
       - name: Set image tag & apply
+        if: ${{ inputs.do_deploy == 'true' && steps.image_exists.outputs.exists == 'false' }}
         run: |
           kubectl set image -n ${{ inputs.kube_namespace }} \
             deployment/${{ inputs.kube_deployment }} \
-            ${{ inputs.kube_container }}=${{ inputs.image_name }}:${{ needs.build.outputs.version }}
+            ${{ inputs.kube_container }}=${{ inputs.image_name }}:${{ steps.version.outputs.version }}
