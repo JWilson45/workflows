@@ -1,0 +1,182 @@
+name: Release Reusable Workflows
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Tag to create (e.g. v1.2.3)"
+        required: false
+        type: string
+      bump:
+        description: "Version bump type"
+        required: false
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      notes:
+        description: "Additional release notes"
+        required: false
+        default: ""
+        type: string
+      prerelease:
+        description: "Mark as prerelease"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: workflows-runner-set
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate version format
+        id: validate
+        run: |
+          VERSION="${{ inputs.version }}"
+          BUMP="${{ inputs.bump }}"
+          if [[ -z "$VERSION" ]]; then
+            # Get latest tag, fallback to v0.0.0 if none
+            LATEST_TAG="$(git describe --tags --abbrev=0 2>/dev/null || echo v0.0.0)"
+            if [[ ! "$LATEST_TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              echo "Latest tag $LATEST_TAG is not SemVer, using v0.0.0" >&2
+              LATEST_TAG="v0.0.0"
+            fi
+            REST="${LATEST_TAG#v}"
+            IFS='.' read -r MAJ MIN PAT <<< "$REST"
+            MAJ="${MAJ:-0}"
+            MIN="${MIN:-0}"
+            PAT="${PAT:-0}"
+            case "$BUMP" in
+              major)
+                ((MAJ+=1))
+                MIN=0
+                PAT=0
+                ;;
+              minor)
+                ((MIN+=1))
+                PAT=0
+                ;;
+              patch|*)
+                ((PAT+=1))
+                ;;
+            esac
+            VERSION="v${MAJ}.${MIN}.${PAT}"
+          fi
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Version must follow SemVer and start with 'v', for example v1.2.3" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "major_tag=${VERSION%%.*}" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure tag does not already exist
+        run: |
+          TAG='${{ steps.validate.outputs.version }}'
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists" >&2
+            exit 1
+          fi
+
+      - name: Create GitHub release
+        id: create_release
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          result-encoding: string
+          script: |
+            const { execSync } = require("child_process");
+            const version = '${{ steps.validate.outputs.version }}';
+            const notes = `${{ inputs.notes }}` || "";
+            const prerelease = Boolean(${{ inputs.prerelease }});
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            // Generate release notes via API
+            const notesResp = await github.rest.repos.generateReleaseNotes({
+              owner,
+              repo,
+              tag_name: version,
+            });
+            const generatedNotes = notesResp.data.body || "";
+            // Find previous tag for workflow diff
+            let prevTag = "";
+            try {
+              prevTag = execSync('git describe --tags --abbrev=0 HEAD^', { encoding: "utf8" }).trim();
+            } catch (e) {
+              prevTag = "";
+            }
+            let changedWorkflowsMD = "## Changed Workflows\n";
+            if (prevTag) {
+              let files = [];
+              try {
+                const raw = execSync(`git diff --name-only ${prevTag}..HEAD -- .github/workflows/`, { encoding: "utf8" });
+                files = raw.split("\n").filter(x => x.trim().length > 0);
+              } catch (e) {
+                files = [];
+              }
+              if (files.length > 0) {
+                changedWorkflowsMD += files.map(f => `- ${f}`).join("\n");
+              } else {
+                changedWorkflowsMD += "- None";
+              }
+            } else {
+              changedWorkflowsMD += "- None";
+            }
+            // Compose release body with changed workflows before generated notes
+            let body;
+            if (notes.trim().length > 0) {
+              body = notes + "\n\n" + changedWorkflowsMD + "\n\n" + generatedNotes;
+            } else {
+              body = changedWorkflowsMD + "\n\n" + generatedNotes;
+            }
+            const release = await github.rest.repos.createRelease({
+              owner,
+              repo,
+              tag_name: version,
+              target_commitish: context.sha,
+              name: `Release ${version}`,
+              draft: false,
+              prerelease,
+              body,
+            });
+            return release.data.html_url;
+
+      - name: Update major version tag
+        uses: actions/github-script@v8
+        env:
+          VERSION: ${{ steps.validate.outputs.version }}
+          MAJOR: ${{ steps.validate.outputs.major_tag }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const versionTag = process.env.VERSION;
+            const majorTag = process.env.MAJOR;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const ref = `refs/tags/${majorTag}`;
+            const sha = context.sha;
+            try {
+              await github.rest.git.getRef({ owner, repo, ref });
+              await github.rest.git.updateRef({ owner, repo, ref, sha, force: true });
+            } catch (error) {
+              if (error.status === 404) {
+                await github.rest.git.createRef({ owner, repo, ref, sha });
+              } else {
+                throw error;
+              }
+            }
+
+      - name: Upload release summary
+        run: |
+          echo "### Published ${{ steps.validate.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Release: ${{ steps.create_release.outputs.result }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Major tag: ${{ steps.validate.outputs.major_tag }}" >> "$GITHUB_STEP_SUMMARY"
