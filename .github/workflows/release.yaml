@@ -43,6 +43,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          fetch-tags: true
 
       - name: Validate version format
         id: validate
@@ -50,10 +51,8 @@ jobs:
           VERSION="${{ inputs.version }}"
           BUMP="${{ inputs.bump }}"
           if [[ -z "$VERSION" ]]; then
-            # Get latest tag, fallback to v0.0.0 if none
-            LATEST_TAG="$(git describe --tags --abbrev=0 2>/dev/null || echo v0.0.0)"
-            if [[ ! "$LATEST_TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-              echo "Latest tag $LATEST_TAG is not SemVer, using v0.0.0" >&2
+            LATEST_TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+            if [ -z "$LATEST_TAG" ]; then
               LATEST_TAG="v0.0.0"
             fi
             REST="${LATEST_TAG#v}"
@@ -117,7 +116,7 @@ jobs:
             // Find previous tag for workflow diff
             let prevTag = "";
             try {
-              prevTag = execSync('git describe --tags --abbrev=0 HEAD^', { encoding: "utf8" }).trim();
+              prevTag = execSync("git tag --sort=-v:refname | grep -E '^v[0-9]+\\.[0-9]+\\.[0-9]+$' | head -n 1", { encoding: "utf8" }).trim();
             } catch (e) {
               prevTag = "";
             }
