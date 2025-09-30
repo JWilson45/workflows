@@ -105,7 +105,6 @@ jobs:
           result-encoding: string
           script: |
             const { execSync } = require("child_process");
-            const core = require("@actions/core");
             const version = '${{ steps.validate.outputs.version }}';
             const notes = `${{ inputs.notes }}` || "";
             const prerelease = Boolean(${{ inputs.prerelease }});
