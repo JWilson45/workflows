@@ -50,8 +50,10 @@ jobs:
         run: |
           VERSION="${{ inputs.version }}"
           BUMP="${{ inputs.bump }}"
+          echo "Inputs: VERSION=$VERSION, BUMP=$BUMP"
           if [[ -z "$VERSION" ]]; then
             LATEST_TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+            echo "Detected latest SemVer tag: $LATEST_TAG"
             if [ -z "$LATEST_TAG" ]; then
               LATEST_TAG="v0.0.0"
             fi
@@ -82,12 +84,14 @@ jobs:
           fi
           REST="${VERSION#v}"
           IFS='.' read -r MAJ MIN PAT <<< "$REST"
+          echo "Computed new version: $VERSION"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "major_tag=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Ensure tag does not already exist
         run: |
           TAG='${{ steps.validate.outputs.version }}'
+          echo "Checking if tag $TAG already exists..."
           if git rev-parse "$TAG" >/dev/null 2>&1; then
             echo "Tag $TAG already exists" >&2
             exit 1
@@ -101,6 +105,7 @@ jobs:
           result-encoding: string
           script: |
             const { execSync } = require("child_process");
+            const core = require("@actions/core");
             const version = '${{ steps.validate.outputs.version }}';
             const notes = `${{ inputs.notes }}` || "";
             const prerelease = Boolean(${{ inputs.prerelease }});
@@ -154,6 +159,7 @@ jobs:
               prerelease,
               body,
             });
+            core.info(`Release created at: ${release.data.html_url}`);
             return release.data.html_url;
 
       - name: Update major version tag
@@ -163,11 +169,13 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
+            const core = require("@actions/core");
             const versionTag = process.env.VERSION;
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const ref = `refs/tags/${versionTag}`;
             const sha = context.sha;
+            core.info(`Updating/creating tag ${ref} at commit ${sha}`);
             try {
               await github.rest.git.getRef({ owner, repo, ref });
               await github.rest.git.updateRef({ owner, repo, ref, sha, force: true });
