@@ -47,7 +47,7 @@ on:
       do_attest:
         description: "Whether to perform attestation (true/false)"
         required: false
-        default: "true"
+        default: "false"
         type: string
     secrets:
       kubeconfig_b64:
