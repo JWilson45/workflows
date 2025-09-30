@@ -44,6 +44,11 @@ on:
         required: false
         default: "ubuntu-latest"
         type: string
+      do_attest:
+        description: "Whether to perform attestation (true/false)"
+        required: false
+        default: "false"
+        type: string
     secrets:
       kubeconfig_b64:
         description: "Base64-encoded kubeconfig"
@@ -52,14 +57,22 @@ on:
 jobs:
   build-and-deploy:
     runs-on: ${{ inputs.runner_label }}
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
     permissions:
-      packages: write
       contents: read
+      packages: write
+      id-token: write
+      attestations: write
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Extract version from package.json
         id: version
@@ -107,15 +120,26 @@ jobs:
 
       - name: Build & push multi-arch image
         if: steps.image_exists.outputs.exists == 'false'
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ${{ inputs.dockerfile }}
           platforms: ${{ inputs.platforms }}
           push: true
+          provenance: mode=max
+          sbom: true
           tags: |
             ${{ inputs.image_name }}:${{ steps.version.outputs.version }}
             ${{ inputs.image_name }}:latest
+
+      - name: Attest image provenance (SLSA)
+        if: steps.image_exists.outputs.exists == 'false' && inputs.do_attest == 'true'
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ${{ inputs.image_name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
 
       - name: Create GitHub Release via curl
         if: steps.image_exists.outputs.exists == 'false'
