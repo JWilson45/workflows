@@ -169,17 +169,19 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const versionTag = process.env.VERSION;
+            const major = versionTag.substring(1).split('.')[0];
+            const majorRef = `tags/v${major}`;
+            const fullMajorRef = `refs/tags/v${major}`;
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const ref = `refs/tags/${versionTag}`;
             const sha = context.sha;
-            core.info(`Updating/creating tag ${ref} at commit ${sha}`);
+            core.info(`Updating/creating major tag ${majorRef} at commit ${sha}`);
             try {
-              await github.rest.git.getRef({ owner, repo, ref });
-              await github.rest.git.updateRef({ owner, repo, ref, sha, force: true });
+              await github.rest.git.getRef({ owner, repo, ref: majorRef });
+              await github.rest.git.updateRef({ owner, repo, ref: majorRef, sha, force: true });
             } catch (error) {
               if (error.status === 404) {
-                await github.rest.git.createRef({ owner, repo, ref, sha });
+                await github.rest.git.createRef({ owner, repo, ref: fullMajorRef, sha });
               } else {
                 throw error;
               }
