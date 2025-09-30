@@ -27,6 +27,10 @@ on:
         default: false
         type: boolean
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 permissions:
   contents: write
   actions: write
@@ -80,7 +84,7 @@ jobs:
           REST="${VERSION#v}"
           IFS='.' read -r MAJ MIN PAT <<< "$REST"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "major_tag=v$MAJ" >> "$GITHUB_OUTPUT"
+          echo "major_tag=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Ensure tag does not already exist
         run: |
@@ -157,15 +161,13 @@ jobs:
         uses: actions/github-script@v8
         env:
           VERSION: ${{ steps.validate.outputs.version }}
-          MAJOR: ${{ steps.validate.outputs.major_tag }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const versionTag = process.env.VERSION;
-            const majorTag = process.env.MAJOR;
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const ref = `refs/tags/${majorTag}`;
+            const ref = `refs/tags/${versionTag}`;
             const sha = context.sha;
             try {
               await github.rest.git.getRef({ owner, repo, ref });
@@ -182,4 +184,4 @@ jobs:
         run: |
           echo "### Published ${{ steps.validate.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- Release: ${{ steps.create_release.outputs.result }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Major tag: ${{ steps.validate.outputs.major_tag }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Version tag: ${{ steps.validate.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
