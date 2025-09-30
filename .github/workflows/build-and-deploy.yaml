@@ -59,6 +59,7 @@ jobs:
       contents: read
       packages: write
       id-token: write
+      attestations: write
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
