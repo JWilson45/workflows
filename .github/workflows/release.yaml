@@ -169,7 +169,6 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const core = require("@actions/core");
             const versionTag = process.env.VERSION;
             const owner = context.repo.owner;
             const repo = context.repo.repo;
