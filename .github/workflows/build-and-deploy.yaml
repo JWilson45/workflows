@@ -44,6 +44,11 @@ on:
         required: false
         default: "ubuntu-latest"
         type: string
+      do_attest:
+        description: "Whether to perform attestation (true/false)"
+        required: false
+        default: "true"
+        type: string
     secrets:
       kubeconfig_b64:
         description: "Base64-encoded kubeconfig"
@@ -129,7 +134,7 @@ jobs:
             ${{ inputs.image_name }}:latest
 
       - name: Attest image provenance (SLSA)
-        if: steps.image_exists.outputs.exists == 'false'
+        if: steps.image_exists.outputs.exists == 'false' && inputs.do_attest == 'true'
         uses: actions/attest-build-provenance@v3
         with:
           subject-name: ${{ inputs.image_name }}
