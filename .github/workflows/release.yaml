@@ -76,8 +76,10 @@ jobs:
             echo "Version must follow SemVer and start with 'v', for example v1.2.3" >&2
             exit 1
           fi
+          REST="${VERSION#v}"
+          IFS='.' read -r MAJ MIN PAT <<< "$REST"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "major_tag=${VERSION%%.*}" >> "$GITHUB_OUTPUT"
+          echo "major_tag=v$MAJ" >> "$GITHUB_OUTPUT"
 
       - name: Ensure tag does not already exist
         run: |
