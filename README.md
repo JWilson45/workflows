@@ -20,6 +20,32 @@ To create a release:
 
 ## Available workflows
 
-- `.github/workflows/build-and-deploy.yaml` – Builds and pushes a container image to GitHub Container Registry (GHCR), can deploy the image to Kubernetes clusters, and creates a GitHub Release for the calling project.
+- `.github/workflows/build-and-deploy.yaml` – Builds and pushes a container image to GitHub Container Registry (GHCR), can deploy the image to Kubernetes clusters, and creates a GitHub Release for the calling project. For pull request builds, the image tag is suffixed as `${version}-pr${number}-${sha}` and the `latest` tag is not updated.
 
 - `.github/workflows/release.yaml` – Manages version bumps and publishes releases for this repository's reusable workflows.
+
+## Helm deployments
+
+The build-and-deploy workflow can deploy with Helm instead of `kubectl`. Helm is enabled when `use_helm: "true"` or when `helm_values_file` is set. The image tag is set via `helm_image_tag_path` (defaults to `image.tag`).
+
+Example usage:
+
+```yaml
+jobs:
+  deploy:
+    uses: jasonwilson/workflows/.github/workflows/build-and-deploy.yaml@v1
+    with:
+      image_name: ghcr.io/org/repo
+      app_dir: apps/micromarketing-modern-api
+      kube_namespace: mmm-dev
+      kube_deployment: mmmodern-api
+      kube_container: mmmodern-api
+      do_deploy: "true"
+      helm_release: mmmodern-api-dev
+      helm_chart: helm/mm-app
+      helm_values_file: apps/micromarketing-modern-api/helm/values-dev.yaml
+      helm_image_tag_path: image.tag
+      helm_set: "extraFlag=true"
+    secrets:
+      kubeconfig_b64: ${{ secrets.KUBECONFIG_B64 }}
+```

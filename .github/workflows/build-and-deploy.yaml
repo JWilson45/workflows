@@ -28,11 +28,11 @@ on:
         type: string
       kube_deployment:
         description: "Kubernetes deployment name"
-        required: true
+        required: false
         type: string
       kube_container:
         description: "Container name inside the deployment"
-        required: true
+        required: false
         type: string
       do_deploy:
         description: "Whether to deploy after build (true/false)"
@@ -48,6 +48,36 @@ on:
         description: "Whether to perform attestation (true/false)"
         required: false
         default: "false"
+        type: string
+      use_helm:
+        description: "Whether to deploy with Helm (true/false). Auto-enabled when helm_values_file is set."
+        required: false
+        default: "false"
+        type: string
+      helm_release:
+        description: "Helm release name"
+        required: false
+        default: ""
+        type: string
+      helm_chart:
+        description: "Helm chart path or reference"
+        required: false
+        default: ""
+        type: string
+      helm_values_file:
+        description: "Helm values file path (optional)"
+        required: false
+        default: ""
+        type: string
+      helm_image_tag_path:
+        description: "Helm values key for the image tag"
+        required: false
+        default: "image.tag"
+        type: string
+      helm_set:
+        description: "Additional Helm --set values (comma-separated, optional)"
+        required: false
+        default: ""
         type: string
     secrets:
       kubeconfig_b64:
@@ -78,12 +108,26 @@ jobs:
         id: version
         run: |
           ver=$(jq -r '.version' "${{ inputs.app_dir }}/package.json")
+          pr_number="${{ github.event.pull_request.number }}"
+          if [ -n "$pr_number" ]; then
+            sha=$(echo "${GITHUB_SHA}" | cut -c1-7)
+            image_tag="${ver}-pr${pr_number}-${sha}"
+          else
+            image_tag="$ver"
+          fi
           echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$image_tag" >> "$GITHUB_OUTPUT"
+          echo "tags<<EOF" >> "$GITHUB_OUTPUT"
+          echo "${{ inputs.image_name }}:$image_tag" >> "$GITHUB_OUTPUT"
+          if [ -z "$pr_number" ]; then
+            echo "${{ inputs.image_name }}:latest" >> "$GITHUB_OUTPUT"
+          fi
+          echo "EOF" >> "$GITHUB_OUTPUT"
 
       - name: Check if image version exists in GHCR
         id: image_exists
         run: |
-          TAG="${{ steps.version.outputs.version }}"
+          TAG="${{ steps.version.outputs.image_tag }}"
           IMAGE_REF="${{ inputs.image_name }}"
           REGISTRY="$(echo $IMAGE_REF | cut -d'/' -f1)"
           REPO="$(echo $IMAGE_REF | cut -d'/' -f2-)"
@@ -104,7 +148,7 @@ jobs:
       - name: Add skip message to workflow summary
         if: steps.image_exists.outputs.exists == 'true'
         run: |
-          echo "### Skipped build & push: tag \`${{ steps.version.outputs.version }}\` already exists." >> $GITHUB_STEP_SUMMARY
+          echo "### Skipped build & push: tag \`${{ steps.version.outputs.image_tag }}\` already exists." >> $GITHUB_STEP_SUMMARY
 
       - name: Set up Docker Buildx
         if: steps.image_exists.outputs.exists == 'false'
@@ -129,9 +173,7 @@ jobs:
           push: true
           provenance: mode=max
           sbom: true
-          tags: |
-            ${{ inputs.image_name }}:${{ steps.version.outputs.version }}
-            ${{ inputs.image_name }}:latest
+          tags: ${{ steps.version.outputs.tags }}
 
       - name: Attest image provenance (SLSA)
         if: steps.image_exists.outputs.exists == 'false' && inputs.do_attest == 'true'
@@ -159,15 +201,49 @@ jobs:
               '{tag_name: $tag, name: $name, draft: false, prerelease: false, generate_release_notes: true}')" \
           | jq '.html_url'
 
+      - name: Validate kubectl inputs
+        if: ${{ inputs.do_deploy == 'true' && steps.image_exists.outputs.exists == 'false' && inputs.use_helm != 'true' && inputs.helm_values_file == '' }}
+        run: |
+          if [ -z "${{ inputs.kube_deployment }}" ] || [ -z "${{ inputs.kube_container }}" ]; then
+            echo "kube_deployment and kube_container are required when Helm is not enabled."
+            exit 1
+          fi
+
       - name: Install kubectl and load kubeconfig
         if: ${{ inputs.do_deploy == 'true' && steps.image_exists.outputs.exists == 'false' }}
         uses: tale/kubectl-action@v1
         with:
           base64-kube-config: ${{ secrets.kubeconfig_b64 }}
 
+      - name: Set up Helm
+        if: ${{ inputs.do_deploy == 'true' && steps.image_exists.outputs.exists == 'false' && (inputs.use_helm == 'true' || inputs.helm_values_file != '') }}
+        uses: azure/setup-helm@v4
+
+      - name: Helm upgrade/install
+        if: ${{ inputs.do_deploy == 'true' && steps.image_exists.outputs.exists == 'false' && (inputs.use_helm == 'true' || inputs.helm_values_file != '') }}
+        run: |
+          if [ -z "${{ inputs.helm_release }}" ] || [ -z "${{ inputs.helm_chart }}" ]; then
+            echo "helm_release and helm_chart are required when Helm is enabled."
+            exit 1
+          fi
+          VALUES_ARG=""
+          if [ -n "${{ inputs.helm_values_file }}" ]; then
+            VALUES_ARG="-f ${{ inputs.helm_values_file }}"
+          fi
+          SET_ARGS="--set ${{ inputs.helm_image_tag_path }}=${{ steps.version.outputs.image_tag }}"
+          if [ -n "${{ inputs.helm_set }}" ]; then
+            SET_ARGS="$SET_ARGS --set ${{ inputs.helm_set }}"
+          fi
+          helm upgrade --install \
+            "${{ inputs.helm_release }}" \
+            "${{ inputs.helm_chart }}" \
+            $VALUES_ARG \
+            -n "${{ inputs.kube_namespace }}" \
+            $SET_ARGS
+
       - name: Set image tag & apply
-        if: ${{ inputs.do_deploy == 'true' && steps.image_exists.outputs.exists == 'false' }}
+        if: ${{ inputs.do_deploy == 'true' && steps.image_exists.outputs.exists == 'false' && inputs.use_helm != 'true' && inputs.helm_values_file == '' }}
         run: |
           kubectl set image -n ${{ inputs.kube_namespace }} \
             deployment/${{ inputs.kube_deployment }} \
-            ${{ inputs.kube_container }}=${{ inputs.image_name }}:${{ steps.version.outputs.version }}
+            ${{ inputs.kube_container }}=${{ inputs.image_name }}:${{ steps.version.outputs.image_tag }}
