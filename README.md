@@ -44,7 +44,6 @@ jobs:
       helm_release: mmmodern-api-dev
       helm_chart: helm/mm-app
       helm_values_file: apps/micromarketing-modern-api/helm/values-dev.yaml
-      helm_namespace: mmm-dev
       helm_image_tag_path: image.tag
       helm_set: "extraFlag=true"
     secrets:
