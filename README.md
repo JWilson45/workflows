@@ -20,7 +20,7 @@ To create a release:
 
 ## Available workflows
 
-- `.github/workflows/build-and-deploy.yaml` – Builds and pushes a container image to GitHub Container Registry (GHCR), can deploy the image to Kubernetes clusters, and creates a GitHub Release for the calling project. For pull request builds, the image tag is suffixed as `${version}-pr${number}-${sha}`.
+- `.github/workflows/build-and-deploy.yaml` – Builds and pushes a container image to GitHub Container Registry (GHCR), can deploy the image to Kubernetes clusters, and creates a GitHub Release for the calling project. For pull request builds, the image tag is suffixed as `${version}-pr${number}-${sha}` and the `latest` tag is not updated.
 
 - `.github/workflows/release.yaml` – Manages version bumps and publishes releases for this repository's reusable workflows.
 

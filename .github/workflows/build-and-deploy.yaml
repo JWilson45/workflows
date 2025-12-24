@@ -117,6 +117,12 @@ jobs:
           fi
           echo "version=$ver" >> "$GITHUB_OUTPUT"
           echo "image_tag=$image_tag" >> "$GITHUB_OUTPUT"
+          echo "tags<<EOF" >> "$GITHUB_OUTPUT"
+          echo "${{ inputs.image_name }}:$image_tag" >> "$GITHUB_OUTPUT"
+          if [ -z "$pr_number" ]; then
+            echo "${{ inputs.image_name }}:latest" >> "$GITHUB_OUTPUT"
+          fi
+          echo "EOF" >> "$GITHUB_OUTPUT"
 
       - name: Check if image version exists in GHCR
         id: image_exists
@@ -167,9 +173,7 @@ jobs:
           push: true
           provenance: mode=max
           sbom: true
-          tags: |
-            ${{ inputs.image_name }}:${{ steps.version.outputs.image_tag }}
-            ${{ inputs.image_name }}:latest
+          tags: ${{ steps.version.outputs.tags }}
 
       - name: Attest image provenance (SLSA)
         if: steps.image_exists.outputs.exists == 'false' && inputs.do_attest == 'true'
