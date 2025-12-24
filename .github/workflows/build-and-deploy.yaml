@@ -28,11 +28,11 @@ on:
         type: string
       kube_deployment:
         description: "Kubernetes deployment name"
-        required: true
+        required: false
         type: string
       kube_container:
         description: "Container name inside the deployment"
-        required: true
+        required: false
         type: string
       do_deploy:
         description: "Whether to deploy after build (true/false)"
@@ -193,6 +193,14 @@ jobs:
               --arg name "Release $TAG" \
               '{tag_name: $tag, name: $name, draft: false, prerelease: false, generate_release_notes: true}')" \
           | jq '.html_url'
+
+      - name: Validate kubectl inputs
+        if: ${{ inputs.do_deploy == 'true' && steps.image_exists.outputs.exists == 'false' && inputs.use_helm != 'true' && inputs.helm_values_file == '' }}
+        run: |
+          if [ -z "${{ inputs.kube_deployment }}" ] || [ -z "${{ inputs.kube_container }}" ]; then
+            echo "kube_deployment and kube_container are required when Helm is not enabled."
+            exit 1
+          fi
 
       - name: Install kubectl and load kubeconfig
         if: ${{ inputs.do_deploy == 'true' && steps.image_exists.outputs.exists == 'false' }}
