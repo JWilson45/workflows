@@ -49,6 +49,41 @@ on:
         required: false
         default: "false"
         type: string
+      use_helm:
+        description: "Whether to deploy with Helm (true/false). Auto-enabled when helm_values_file is set."
+        required: false
+        default: "false"
+        type: string
+      helm_release:
+        description: "Helm release name"
+        required: false
+        default: ""
+        type: string
+      helm_chart:
+        description: "Helm chart path or reference"
+        required: false
+        default: ""
+        type: string
+      helm_values_file:
+        description: "Helm values file path (optional)"
+        required: false
+        default: ""
+        type: string
+      helm_namespace:
+        description: "Helm namespace override (optional)"
+        required: false
+        default: ""
+        type: string
+      helm_image_tag_path:
+        description: "Helm values key for the image tag"
+        required: false
+        default: "image.tag"
+        type: string
+      helm_set:
+        description: "Additional Helm --set values (comma-separated, optional)"
+        required: false
+        default: ""
+        type: string
     secrets:
       kubeconfig_b64:
         description: "Base64-encoded kubeconfig"
@@ -165,8 +200,38 @@ jobs:
         with:
           base64-kube-config: ${{ secrets.kubeconfig_b64 }}
 
+      - name: Set up Helm
+        if: ${{ inputs.do_deploy == 'true' && steps.image_exists.outputs.exists == 'false' && (inputs.use_helm == 'true' || inputs.helm_values_file != '') }}
+        uses: azure/setup-helm@v4
+
+      - name: Helm upgrade/install
+        if: ${{ inputs.do_deploy == 'true' && steps.image_exists.outputs.exists == 'false' && (inputs.use_helm == 'true' || inputs.helm_values_file != '') }}
+        run: |
+          if [ -z "${{ inputs.helm_release }}" ] || [ -z "${{ inputs.helm_chart }}" ]; then
+            echo "helm_release and helm_chart are required when Helm is enabled."
+            exit 1
+          fi
+          NAMESPACE="${{ inputs.helm_namespace }}"
+          if [ -z "$NAMESPACE" ]; then
+            NAMESPACE="${{ inputs.kube_namespace }}"
+          fi
+          VALUES_ARG=""
+          if [ -n "${{ inputs.helm_values_file }}" ]; then
+            VALUES_ARG="-f ${{ inputs.helm_values_file }}"
+          fi
+          SET_ARGS="--set ${{ inputs.helm_image_tag_path }}=${{ steps.version.outputs.version }}"
+          if [ -n "${{ inputs.helm_set }}" ]; then
+            SET_ARGS="$SET_ARGS --set ${{ inputs.helm_set }}"
+          fi
+          helm upgrade --install \
+            "${{ inputs.helm_release }}" \
+            "${{ inputs.helm_chart }}" \
+            $VALUES_ARG \
+            -n "$NAMESPACE" \
+            $SET_ARGS
+
       - name: Set image tag & apply
-        if: ${{ inputs.do_deploy == 'true' && steps.image_exists.outputs.exists == 'false' }}
+        if: ${{ inputs.do_deploy == 'true' && steps.image_exists.outputs.exists == 'false' && inputs.use_helm != 'true' && inputs.helm_values_file == '' }}
         run: |
           kubectl set image -n ${{ inputs.kube_namespace }} \
             deployment/${{ inputs.kube_deployment }} \
