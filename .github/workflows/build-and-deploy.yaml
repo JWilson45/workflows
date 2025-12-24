@@ -108,12 +108,20 @@ jobs:
         id: version
         run: |
           ver=$(jq -r '.version' "${{ inputs.app_dir }}/package.json")
+          pr_number="${{ github.event.pull_request.number }}"
+          if [ -n "$pr_number" ]; then
+            sha=$(echo "${GITHUB_SHA}" | cut -c1-7)
+            image_tag="${ver}-pr${pr_number}-${sha}"
+          else
+            image_tag="$ver"
+          fi
           echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$image_tag" >> "$GITHUB_OUTPUT"
 
       - name: Check if image version exists in GHCR
         id: image_exists
         run: |
-          TAG="${{ steps.version.outputs.version }}"
+          TAG="${{ steps.version.outputs.image_tag }}"
           IMAGE_REF="${{ inputs.image_name }}"
           REGISTRY="$(echo $IMAGE_REF | cut -d'/' -f1)"
           REPO="$(echo $IMAGE_REF | cut -d'/' -f2-)"
@@ -134,7 +142,7 @@ jobs:
       - name: Add skip message to workflow summary
         if: steps.image_exists.outputs.exists == 'true'
         run: |
-          echo "### Skipped build & push: tag \`${{ steps.version.outputs.version }}\` already exists." >> $GITHUB_STEP_SUMMARY
+          echo "### Skipped build & push: tag \`${{ steps.version.outputs.image_tag }}\` already exists." >> $GITHUB_STEP_SUMMARY
 
       - name: Set up Docker Buildx
         if: steps.image_exists.outputs.exists == 'false'
@@ -160,7 +168,7 @@ jobs:
           provenance: mode=max
           sbom: true
           tags: |
-            ${{ inputs.image_name }}:${{ steps.version.outputs.version }}
+            ${{ inputs.image_name }}:${{ steps.version.outputs.image_tag }}
             ${{ inputs.image_name }}:latest
 
       - name: Attest image provenance (SLSA)
@@ -218,7 +226,7 @@ jobs:
           if [ -n "${{ inputs.helm_values_file }}" ]; then
             VALUES_ARG="-f ${{ inputs.helm_values_file }}"
           fi
-          SET_ARGS="--set ${{ inputs.helm_image_tag_path }}=${{ steps.version.outputs.version }}"
+          SET_ARGS="--set ${{ inputs.helm_image_tag_path }}=${{ steps.version.outputs.image_tag }}"
           if [ -n "${{ inputs.helm_set }}" ]; then
             SET_ARGS="$SET_ARGS --set ${{ inputs.helm_set }}"
           fi
@@ -234,4 +242,4 @@ jobs:
         run: |
           kubectl set image -n ${{ inputs.kube_namespace }} \
             deployment/${{ inputs.kube_deployment }} \
-            ${{ inputs.kube_container }}=${{ inputs.image_name }}:${{ steps.version.outputs.version }}
+            ${{ inputs.kube_container }}=${{ inputs.image_name }}:${{ steps.version.outputs.image_tag }}
