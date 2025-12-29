@@ -35,25 +35,20 @@ on:
         required: false
         type: string
       do_deploy:
-        description: "Whether to deploy after build (true/false)"
+        description: "Whether to deploy after build"
         required: false
-        default: "true"
-        type: string
+        default: true
+        type: boolean
       runner_label:
         description: "Runner label to use (e.g. ubuntu-latest, mm-runner-set)"
         required: false
         default: "ubuntu-latest"
         type: string
       do_attest:
-        description: "Whether to perform attestation (true/false)"
+        description: "Whether to perform attestation"
         required: false
-        default: "false"
-        type: string
-      use_helm:
-        description: "Whether to deploy with Helm (true/false). Auto-enabled when helm_values_file is set."
-        required: false
-        default: "false"
-        type: string
+        default: false
+        type: boolean
       helm_release:
         description: "Helm release name"
         required: false
@@ -65,7 +60,7 @@ on:
         default: ""
         type: string
       helm_values_file:
-        description: "Helm values file path (optional)"
+        description: "Helm values file path (optional, does NOT enable Helm by itself)"
         required: false
         default: ""
         type: string
@@ -97,6 +92,9 @@ jobs:
       attestations: write
     outputs:
       version: ${{ steps.version.outputs.version }}
+    env:
+      IS_MANUAL: ${{ github.event_name == 'workflow_dispatch' }}
+      IS_RERUN: ${{ github.run_attempt > 1 }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -145,17 +143,67 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Add skip message to workflow summary
-        if: steps.image_exists.outputs.exists == 'true'
+      - name: Compute flags
+        id: flags
+        shell: bash
         run: |
-          echo "### Skipped build & push: tag \`${{ steps.version.outputs.image_tag }}\` already exists." >> $GITHUB_STEP_SUMMARY
+          # Derived booleans used to simplify later step conditionals
+          use_helm=false
+          # Helm is enabled ONLY when an explicit Helm deploy is requested
+          # (helm_release + helm_chart define intent). helm_values_file is config-only.
+          if [ -n "${{ inputs.helm_chart }}" ] || [ -n "${{ inputs.helm_release }}" ]; then
+            use_helm=true
+          fi
+
+          should_build=false
+          if [ "${{ steps.image_exists.outputs.exists }}" = "false" ]; then
+            should_build=true
+          fi
+
+          is_override=false
+          # Treat manual dispatch OR a re-run attempt as an operator override.
+          if [ "${IS_MANUAL}" = "true" ] || [ "${IS_RERUN}" = "true" ]; then
+            is_override=true
+          fi
+
+          should_deploy=false
+          if [ "${{ inputs.do_deploy }}" = "true" ] && ( [ "$should_build" = "true" ] || [ "$is_override" = "true" ] ); then
+            should_deploy=true
+          fi
+
+          should_helm_deploy=false
+          if [ "$should_deploy" = "true" ] && [ "$use_helm" = "true" ]; then
+            should_helm_deploy=true
+          fi
+
+          should_kubectl_deploy=false
+          if [ "$should_deploy" = "true" ] && [ "$use_helm" = "false" ]; then
+            should_kubectl_deploy=true
+          fi
+
+          echo "use_helm=$use_helm" >> "$GITHUB_OUTPUT"
+          echo "should_build=$should_build" >> "$GITHUB_OUTPUT"
+          echo "should_deploy=$should_deploy" >> "$GITHUB_OUTPUT"
+          echo "should_helm_deploy=$should_helm_deploy" >> "$GITHUB_OUTPUT"
+          echo "should_kubectl_deploy=$should_kubectl_deploy" >> "$GITHUB_OUTPUT"
+
+      - name: Add skip message to workflow summary
+        if: steps.flags.outputs.should_build == 'false'
+        run: |
+          if [ "${IS_MANUAL}" = "true" ]; then
+            echo "### Skipped build & push: tag \`${{ steps.version.outputs.image_tag }}\` already exists. Deploying existing image (manual dispatch)." >> $GITHUB_STEP_SUMMARY
+          elif [ "${IS_RERUN}" = "true" ]; then
+            echo "### Skipped build & push: tag \`${{ steps.version.outputs.image_tag }}\` already exists. Deploying existing image (re-run attempt)." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### Skipped build & push: tag \`${{ steps.version.outputs.image_tag }}\` already exists." >> $GITHUB_STEP_SUMMARY
+          fi
 
       - name: Set up Docker Buildx
-        if: steps.image_exists.outputs.exists == 'false'
+        if: steps.flags.outputs.should_build == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        if: steps.image_exists.outputs.exists == 'false'
+        if: steps.flags.outputs.should_build == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -163,7 +211,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build & push multi-arch image
-        if: steps.image_exists.outputs.exists == 'false'
+        if: steps.flags.outputs.should_build == 'true'
         id: build
         uses: docker/build-push-action@v5
         with:
@@ -176,7 +224,7 @@ jobs:
           tags: ${{ steps.version.outputs.tags }}
 
       - name: Attest image provenance (SLSA)
-        if: steps.image_exists.outputs.exists == 'false' && inputs.do_attest == 'true'
+        if: steps.flags.outputs.should_build == 'true' && inputs.do_attest
         uses: actions/attest-build-provenance@v3
         with:
           subject-name: ${{ inputs.image_name }}
@@ -184,7 +232,7 @@ jobs:
           push-to-registry: true
 
       - name: Create GitHub Release via curl
-        if: steps.image_exists.outputs.exists == 'false'
+        if: steps.flags.outputs.should_build == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -202,7 +250,7 @@ jobs:
           | jq '.html_url'
 
       - name: Validate kubectl inputs
-        if: ${{ inputs.do_deploy == 'true' && steps.image_exists.outputs.exists == 'false' && inputs.use_helm != 'true' && inputs.helm_values_file == '' }}
+        if: steps.flags.outputs.should_kubectl_deploy == 'true'
         run: |
           if [ -z "${{ inputs.kube_deployment }}" ] || [ -z "${{ inputs.kube_container }}" ]; then
             echo "kube_deployment and kube_container are required when Helm is not enabled."
@@ -210,20 +258,20 @@ jobs:
           fi
 
       - name: Install kubectl and load kubeconfig
-        if: ${{ inputs.do_deploy == 'true' && steps.image_exists.outputs.exists == 'false' }}
+        if: steps.flags.outputs.should_deploy == 'true'
         uses: tale/kubectl-action@v1
         with:
           base64-kube-config: ${{ secrets.kubeconfig_b64 }}
 
       - name: Set up Helm
-        if: ${{ inputs.do_deploy == 'true' && steps.image_exists.outputs.exists == 'false' && (inputs.use_helm == 'true' || inputs.helm_values_file != '') }}
+        if: steps.flags.outputs.should_helm_deploy == 'true'
         uses: azure/setup-helm@v4
 
       - name: Helm upgrade/install
-        if: ${{ inputs.do_deploy == 'true' && steps.image_exists.outputs.exists == 'false' && (inputs.use_helm == 'true' || inputs.helm_values_file != '') }}
+        if: steps.flags.outputs.should_helm_deploy == 'true'
         run: |
           if [ -z "${{ inputs.helm_release }}" ] || [ -z "${{ inputs.helm_chart }}" ]; then
-            echo "helm_release and helm_chart are required when Helm is enabled."
+            echo "helm_release and helm_chart are required when Helm deploy is enabled (set helm_release + helm_chart)."
             exit 1
           fi
           VALUES_ARG=""
@@ -242,7 +290,7 @@ jobs:
             $SET_ARGS
 
       - name: Set image tag & apply
-        if: ${{ inputs.do_deploy == 'true' && steps.image_exists.outputs.exists == 'false' && inputs.use_helm != 'true' && inputs.helm_values_file == '' }}
+        if: steps.flags.outputs.should_kubectl_deploy == 'true'
         run: |
           kubectl set image -n ${{ inputs.kube_namespace }} \
             deployment/${{ inputs.kube_deployment }} \
