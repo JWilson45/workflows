@@ -94,6 +94,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     env:
       IS_MANUAL: ${{ github.event_name == 'workflow_dispatch' }}
+      IS_RERUN: ${{ github.run_attempt > 1 }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -159,13 +160,14 @@ jobs:
             should_build=true
           fi
 
-          is_manual=false
-          if [ "${IS_MANUAL}" = "true" ]; then
-            is_manual=true
+          is_override=false
+          # Treat manual dispatch OR a re-run attempt as an operator override.
+          if [ "${IS_MANUAL}" = "true" ] || [ "${IS_RERUN}" = "true" ]; then
+            is_override=true
           fi
 
           should_deploy=false
-          if [ "${{ inputs.do_deploy }}" = "true" ] && ( [ "$should_build" = "true" ] || [ "$is_manual" = "true" ] ); then
+          if [ "${{ inputs.do_deploy }}" = "true" ] && ( [ "$should_build" = "true" ] || [ "$is_override" = "true" ] ); then
             should_deploy=true
           fi
 
@@ -190,6 +192,8 @@ jobs:
         run: |
           if [ "${IS_MANUAL}" = "true" ]; then
             echo "### Skipped build & push: tag \`${{ steps.version.outputs.image_tag }}\` already exists. Deploying existing image (manual dispatch)." >> $GITHUB_STEP_SUMMARY
+          elif [ "${IS_RERUN}" = "true" ]; then
+            echo "### Skipped build & push: tag \`${{ steps.version.outputs.image_tag }}\` already exists. Deploying existing image (re-run attempt)." >> $GITHUB_STEP_SUMMARY
           else
             echo "### Skipped build & push: tag \`${{ steps.version.outputs.image_tag }}\` already exists." >> $GITHUB_STEP_SUMMARY
           fi
