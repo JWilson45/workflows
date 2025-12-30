@@ -222,6 +222,10 @@ jobs:
           provenance: mode=max
           sbom: true
           tags: ${{ steps.version.outputs.tags }}
+          cache-from: |
+            type=gha,scope=${{ inputs.image_name }}
+          cache-to: |
+            type=gha,mode=max,scope=${{ inputs.image_name }}
 
       - name: Attest image provenance (SLSA)
         if: steps.flags.outputs.should_build == 'true' && inputs.do_attest
