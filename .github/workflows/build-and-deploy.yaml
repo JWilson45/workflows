@@ -223,17 +223,9 @@ jobs:
           sbom: true
           tags: ${{ steps.version.outputs.tags }}
           cache-from: |
-            type=registry,ref=${{ inputs.image_name }}:buildcache
-            type=registry,ref=${{ inputs.image_name }}:latest
+            type=gha,scope=${{ inputs.image_name }}
           cache-to: |
-            type=registry,ref=${{ inputs.image_name }}:buildcache,mode=max
-
-      - name: Note build cache usage
-        if: steps.flags.outputs.should_build == 'true'
-        run: |
-          echo "### Docker build cache" >> $GITHUB_STEP_SUMMARY
-          echo "Using registry cache-from: ${{ inputs.image_name }}:buildcache and :latest" >> $GITHUB_STEP_SUMMARY
-          echo "Publishing cache-to: ${{ inputs.image_name }}:buildcache" >> $GITHUB_STEP_SUMMARY
+            type=gha,mode=max,scope=${{ inputs.image_name }}
 
       - name: Attest image provenance (SLSA)
         if: steps.flags.outputs.should_build == 'true' && inputs.do_attest
