@@ -1,0 +1,108 @@
+
+
+name: Clean PR images (GHCR)
+
+on:
+  workflow_call:
+    inputs:
+      package_name:
+        description: "GHCR package name (container image name, without ghcr.io/owner/)"
+        required: true
+        type: string
+      pr_number:
+        description: "Pull request number to clean up (e.g., 38)"
+        required: true
+        type: number
+      owner:
+        description: "Package owner (org or user). Defaults to repository owner."
+        required: false
+        type: string
+      owner_type:
+        description: "Set to 'org' if the package is owned by an organization; otherwise 'user'."
+        required: false
+        default: "user"
+        type: string
+      tag_regex:
+        description: "Regex used to match PR tags. Default matches: pr-<N>, pr<N>, and any tag containing -pr<N>-"
+        required: false
+        type: string
+      dry_run:
+        description: "If true, prints what would be deleted but does not delete."
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+
+    steps:
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.owner_type }}" != "user" && "${{ inputs.owner_type }}" != "org" ]]; then
+            echo "owner_type must be 'user' or 'org'" >&2
+            exit 1
+          fi
+
+      - name: Delete PR-tagged GHCR package versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ inputs.owner || github.repository_owner }}
+          OWNER_TYPE: ${{ inputs.owner_type }}
+          IMAGE: ${{ inputs.package_name }}
+          PRNUM: ${{ inputs.pr_number }}
+          TAG_REGEX: ${{ inputs.tag_regex }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Default tag matcher:
+          # - pr-<N>  (e.g., pr-38)
+          # - pr<N>   (e.g., pr38)
+          # - any tag containing -pr<N>- (e.g., 0.5.7-pr38-bd1e38e)
+          if [[ -z "${TAG_REGEX:-}" ]]; then
+            TAG_REGEX="(^pr-${PRNUM}$|^pr${PRNUM}$|-pr${PRNUM}-)"
+          fi
+
+          # GHCR versions endpoint differs for user vs org packages
+          if [[ "$OWNER_TYPE" == "org" ]]; then
+            VERSIONS_ENDPOINT="/orgs/${OWNER}/packages/container/${IMAGE}/versions"
+          else
+            VERSIONS_ENDPOINT="/users/${OWNER}/packages/container/${IMAGE}/versions"
+          fi
+
+          echo "Owner:      ${OWNER} (${OWNER_TYPE})"
+          echo "Package:    ${IMAGE}"
+          echo "PR number:  ${PRNUM}"
+          echo "Tag regex:  ${TAG_REGEX}"
+          echo "Endpoint:   ${VERSIONS_ENDPOINT}"
+
+          # Collect version IDs where ANY tag matches TAG_REGEX
+          ids=$(gh api "${VERSIONS_ENDPOINT}" --paginate \
+            --jq ".[] | select(.metadata.container.tags[]? | test(\"${TAG_REGEX}\")) | .id")
+
+          if [[ -z "${ids}" ]]; then
+            echo "No matching PR-tagged versions found. Nothing to delete."
+            exit 0
+          fi
+
+          echo "Matching version IDs:" 
+          echo "${ids}"
+
+          if [[ "${DRY_RUN}" == "true" ]]; then
+            echo "DRY RUN enabled; skipping deletion."
+            exit 0
+          fi
+
+          # Delete each matching version (digest). This removes all tags pointing at that version.
+          while read -r id; do
+            [[ -z "${id}" ]] && continue
+            gh api --method DELETE "${VERSIONS_ENDPOINT}/${id}"
+            echo "Deleted version ${id}"
+          done <<< "${ids}"
