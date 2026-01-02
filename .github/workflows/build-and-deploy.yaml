@@ -26,14 +26,14 @@ on:
         required: false
         default: "default"
         type: string
-      kube_deployment:
-        description: "Kubernetes deployment name"
-        required: false
-        type: string
-      kube_container:
-        description: "Container name inside the deployment"
-        required: false
-        type: string
+      # kube_deployment:
+      #   description: "Kubernetes deployment name"
+      #   required: false
+      #   type: string
+      # kube_container:
+      #   description: "Container name inside the deployment"
+      #   required: false
+      #   type: string
       do_deploy:
         description: "Whether to deploy after build"
         required: false
@@ -44,11 +44,6 @@ on:
         required: false
         default: "ubuntu-latest"
         type: string
-      do_attest:
-        description: "Whether to perform attestation"
-        required: false
-        default: false
-        type: boolean
       helm_release:
         description: "Helm release name"
         required: false
@@ -89,7 +84,6 @@ jobs:
       contents: read
       packages: write
       id-token: write
-      attestations: write
     outputs:
       version: ${{ steps.version.outputs.version }}
     env:
@@ -97,7 +91,7 @@ jobs:
       IS_RERUN: ${{ github.run_attempt > 1 }}
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 1
           persist-credentials: false
@@ -227,49 +221,32 @@ jobs:
           cache-to: |
             type=gha,mode=max,scope=${{ inputs.image_name }}
 
-      - name: Attest image provenance (SLSA)
-        if: steps.flags.outputs.should_build == 'true' && inputs.do_attest
-        uses: actions/attest-build-provenance@v3
-        with:
-          subject-name: ${{ inputs.image_name }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
 
-      - name: Create GitHub Release via curl
-        if: steps.flags.outputs.should_build == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          OWNER="${{ github.repository_owner }}"
-          REPO="${{ github.event.repository.name }}"
-          TAG="${{ steps.version.outputs.version }}"
-          curl -s -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/$OWNER/$REPO/releases" \
-            -d "$(jq -n \
-              --arg tag "$TAG" \
-              --arg name "Release $TAG" \
-              '{tag_name: $tag, name: $name, draft: false, prerelease: false, generate_release_notes: true}')" \
-          | jq '.html_url'
+      # - name: Validate kubectl inputs
+      #   if: steps.flags.outputs.should_kubectl_deploy == 'true'
+      #   run: |
+      #     if [ -z "${{ inputs.kube_deployment }}" ] || [ -z "${{ inputs.kube_container }}" ]; then
+      #       echo "kube_deployment and kube_container are required when Helm is not enabled."
+      #       exit 1
+      #     fi
 
-      - name: Validate kubectl inputs
-        if: steps.flags.outputs.should_kubectl_deploy == 'true'
-        run: |
-          if [ -z "${{ inputs.kube_deployment }}" ] || [ -z "${{ inputs.kube_container }}" ]; then
-            echo "kube_deployment and kube_container are required when Helm is not enabled."
-            exit 1
-          fi
-
-      - name: Install kubectl and load kubeconfig
-        if: steps.flags.outputs.should_deploy == 'true'
-        uses: tale/kubectl-action@v1
-        with:
-          base64-kube-config: ${{ secrets.kubeconfig_b64 }}
+      # - name: Install kubectl and load kubeconfig
+      #   if: steps.flags.outputs.should_kubectl_deploy == 'true'
+      #   uses: tale/kubectl-action@v1
+      #   with:
+      #     base64-kube-config: ${{ secrets.kubeconfig_b64 }}
 
       - name: Set up Helm
         if: steps.flags.outputs.should_helm_deploy == 'true'
         uses: azure/setup-helm@v4
+
+      - name: Load kubeconfig for Helm
+        if: steps.flags.outputs.should_helm_deploy == 'true'
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.kubeconfig_b64 }}" | base64 --decode > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
 
       - name: Helm upgrade/install
         if: steps.flags.outputs.should_helm_deploy == 'true'
@@ -293,9 +270,9 @@ jobs:
             -n "${{ inputs.kube_namespace }}" \
             $SET_ARGS
 
-      - name: Set image tag & apply
-        if: steps.flags.outputs.should_kubectl_deploy == 'true'
-        run: |
-          kubectl set image -n ${{ inputs.kube_namespace }} \
-            deployment/${{ inputs.kube_deployment }} \
-            ${{ inputs.kube_container }}=${{ inputs.image_name }}:${{ steps.version.outputs.image_tag }}
+      # - name: Set image tag & apply
+      #   if: steps.flags.outputs.should_kubectl_deploy == 'true'
+      #   run: |
+      #     kubectl set image -n ${{ inputs.kube_namespace }} \
+      #       deployment/${{ inputs.kube_deployment }} \
+      #       ${{ inputs.kube_container }}=${{ inputs.image_name }}:${{ steps.version.outputs.image_tag }}
