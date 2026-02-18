@@ -1,18 +1,12 @@
-
-
 name: Clean PR images (GHCR)
 
 on:
-  workflow_call:
+  workflow_dispatch:
     inputs:
-      package_name:
-        description: "GHCR package name (container image name, without ghcr.io/owner/)"
+      repository_name:
+        description: "Repository name / GHCR image name (container package name, without ghcr.io/owner/)"
         required: true
         type: string
-      pr_number:
-        description: "Pull request number to clean up (e.g., 38)"
-        required: true
-        type: number
       owner:
         description: "Package owner (org or user). Defaults to repository owner."
         required: false
@@ -22,19 +16,20 @@ on:
         required: false
         default: "user"
         type: string
-      tag_regex:
-        description: "Regex used to match PR tags. Default matches: pr-<N>, pr<N>, and any tag containing -pr<N>-"
-        required: false
-        type: string
       dry_run:
         description: "If true, prints what would be deleted but does not delete."
         required: false
-        default: false
+        default: true
         type: boolean
+      runner:
+        description: "GitHub Actions runner label"
+        required: false
+        default: "ubuntu-latest"
+        type: string
 
 jobs:
   cleanup:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.inputs.runner || 'ubuntu-latest' }}
     permissions:
       packages: write
       contents: read
@@ -44,7 +39,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "${{ inputs.owner_type }}" != "user" && "${{ inputs.owner_type }}" != "org" ]]; then
+
+          if [[ -z "${{ github.event.inputs.repository_name }}" ]]; then
+            echo "repository_name is required" >&2
+            exit 1
+          fi
+
+          if [[ "${{ github.event.inputs.owner_type }}" != "user" && "${{ github.event.inputs.owner_type }}" != "org" ]]; then
             echo "owner_type must be 'user' or 'org'" >&2
             exit 1
           fi
@@ -52,57 +53,94 @@ jobs:
       - name: Delete PR-tagged GHCR package versions
         env:
           GH_TOKEN: ${{ github.token }}
-          OWNER: ${{ inputs.owner || github.repository_owner }}
-          OWNER_TYPE: ${{ inputs.owner_type }}
-          IMAGE: ${{ inputs.package_name }}
-          PRNUM: ${{ inputs.pr_number }}
-          TAG_REGEX: ${{ inputs.tag_regex }}
-          DRY_RUN: ${{ inputs.dry_run }}
+          OWNER: ${{ github.event.inputs.owner || github.repository_owner }}
+          OWNER_TYPE: ${{ github.event.inputs.owner_type || 'user' }}
+          IMAGE: ${{ github.event.inputs.repository_name }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || false }}
         shell: bash
         run: |
           set -euo pipefail
 
-          # Default tag matcher:
-          # - pr-<N>  (e.g., pr-38)
-          # - pr<N>   (e.g., pr38)
-          # - any tag containing -pr<N>- (e.g., 0.5.7-pr38-bd1e38e)
-          if [[ -z "${TAG_REGEX:-}" ]]; then
-            TAG_REGEX="(^pr-${PRNUM}$|^pr${PRNUM}$|-pr${PRNUM}-)"
+          if [[ -z "${IMAGE:-}" ]]; then
+            echo "package_name is required (IMAGE env is empty)" >&2
+            exit 1
           fi
 
+          # Match ANY PR-related tags of the form: -pr<digits>-
+          MODE="manual"
+          TAG_REGEX="-pr[0-9]+-"
+
           # GHCR versions endpoint differs for user vs org packages
-          if [[ "$OWNER_TYPE" == "org" ]]; then
+          if [[ "${OWNER_TYPE}" == "org" ]]; then
             VERSIONS_ENDPOINT="/orgs/${OWNER}/packages/container/${IMAGE}/versions"
           else
             VERSIONS_ENDPOINT="/users/${OWNER}/packages/container/${IMAGE}/versions"
           fi
 
+          echo "Mode:       ${MODE}"
           echo "Owner:      ${OWNER} (${OWNER_TYPE})"
           echo "Package:    ${IMAGE}"
-          echo "PR number:  ${PRNUM}"
           echo "Tag regex:  ${TAG_REGEX}"
           echo "Endpoint:   ${VERSIONS_ENDPOINT}"
+          echo "Dry run:    ${DRY_RUN}"
 
-          # Collect version IDs where ANY tag matches TAG_REGEX
-          ids=$(gh api "${VERSIONS_ENDPOINT}" --paginate \
-            --jq ".[] | select(.metadata.container.tags[]? | test(\"${TAG_REGEX}\")) | .id")
+          {
+            echo "## GHCR cleanup"
+            echo "- **Mode:** ${MODE}"
+            echo "- **Owner:** ${OWNER} (${OWNER_TYPE})"
+            echo "- **Package:** ${IMAGE}"
+            echo "- **Tag regex:** \`${TAG_REGEX}\`"
+            echo "- **Dry run:** ${DRY_RUN}"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
 
-          if [[ -z "${ids}" ]]; then
-            echo "No matching PR-tagged versions found. Nothing to delete."
+          # Build a report of matching versions with the specific matching tags.
+          # Output format: <id>\t<tag1,tag2,...>
+          report=$(gh api "${VERSIONS_ENDPOINT}" --paginate --jq "
+            .[]
+            | . as \$v
+            | [(.metadata.container.tags // [])[] | select(test(\"${TAG_REGEX}\"))] as \$mt
+            | select((\$mt|length) > 0)
+            | (\$v.id|tostring) + \"\\t\" + (\$mt|join(\",\"))
+          ")
+
+          if [[ -z "${report}" ]]; then
+            echo "No matching versions found. Nothing to delete."
+            echo "✅ No matching versions found. Nothing to delete." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
-          echo "Matching version IDs:" 
-          echo "${ids}"
+          echo "Matched versions (version_id\tmatching_tags):"
+          echo "${report}"
+
+          {
+            echo "### Matched versions"
+            echo "| Version ID | Matching tags |"
+            echo "|---:|---|"
+            while IFS=$'\t' read -r vid mtags; do
+              [[ -z "${vid}" ]] && continue
+              echo "| ${vid} | ${mtags} |"
+            done <<< "${report}"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Extract unique version IDs
+          ids=$(printf "%s\n" "${report}" | cut -f1 | sort -u)
 
           if [[ "${DRY_RUN}" == "true" ]]; then
             echo "DRY RUN enabled; skipping deletion."
+            echo "🧪 **Dry run**: no deletions performed." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
-          # Delete each matching version (digest). This removes all tags pointing at that version.
+          echo "Deleting matching versions..."
+          deleted_count=0
           while read -r id; do
             [[ -z "${id}" ]] && continue
             gh api --method DELETE "${VERSIONS_ENDPOINT}/${id}"
             echo "Deleted version ${id}"
+            deleted_count=$((deleted_count+1))
           done <<< "${ids}"
+
+          echo "Deleted ${deleted_count} version(s)."
+          echo "🗑️ Deleted **${deleted_count}** version(s)." >> "$GITHUB_STEP_SUMMARY"
