@@ -18,11 +18,15 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
+            const dispatchRef =
+              context.payload?.repository?.default_branch ||
+              process.env.GITHUB_REF_NAME ||
+              "main";
             await github.rest.actions.createWorkflowDispatch({
               owner: context.repo.owner,
               repo: context.repo.repo,
               workflow_id: "cleanup-pr-images.yaml",
-              ref: context.ref_name,
+              ref: dispatchRef,
               inputs: {
                 image_name: "ghcr.io/JWilson45/mmmodern-web,ghcr.io/JWilson45/mmmodern-api,ghcr.io/JWilson45/mm",
                 pr_numbers: "",
@@ -30,4 +34,4 @@ jobs:
                 require_approval: "false",
               },
             });
-            core.info("Dispatched cleanup-pr-images.yaml with weekly inputs.");
+            core.info(`Dispatched cleanup-pr-images.yaml on ref ${dispatchRef} with weekly inputs.`);
