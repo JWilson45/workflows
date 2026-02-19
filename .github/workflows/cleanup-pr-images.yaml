@@ -39,6 +39,11 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: |
+            .github/scripts/ghcr-cleanup
 
       - name: Build delete plan (dry run)
         id: plan
@@ -71,6 +76,11 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: |
+            .github/scripts/ghcr-cleanup
 
       - name: Download delete plan artifact
         uses: actions/download-artifact@v4
@@ -98,6 +108,11 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: |
+            .github/scripts/ghcr-cleanup
 
       - name: Download delete plan artifact
         uses: actions/download-artifact@v4
