@@ -4,32 +4,22 @@ on:
   workflow_dispatch:
     inputs:
       image_name:
-        description: "Optional full GHCR image name (e.g. ghcr.io/org/repo). If empty, uses ghcr.io/<ghcr_owner>/<ghcr_package|repo-name>."
-        required: false
-        default: ""
-        type: string
-      ghcr_owner:
-        description: "Default GHCR owner/org when image_name is not provided."
-        required: true
-        default: "JWilson45"
-        type: string
-      ghcr_package:
-        description: "Optional GHCR package name when image_name is not provided. Defaults to current repository name."
+        description: "Image (default: ghcr.io/JWilson45/<repo>)"
         required: false
         default: ""
         type: string
       pr_numbers:
-        description: "Optional comma-separated PR numbers (e.g. 123,456). Leave blank to target all PR-tagged images."
+        description: "PRs (e.g. 123,456). Blank = all"
         required: false
         default: ""
         type: string
       dry-run:
-        description: "If true, only preview what would be deleted."
+        description: "dry run"
         required: true
         default: true
         type: boolean
       older_than_days:
-        description: "Only delete PR image versions older than this many days."
+        description: "Delete versions older than N days"
         required: true
         default: 7
         type: number
@@ -46,12 +36,12 @@ jobs:
         env:
           IMAGE_NAME: ${{ inputs.image_name }}
           PR_NUMBERS: ${{ inputs.pr_numbers }}
-          DRY_RUN: ${{ inputs.dry_run }}
+          DRY_RUN: ${{ inputs['dry-run'] }}
           OLDER_THAN_DAYS: ${{ inputs.older_than_days }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const imageName = String(process.env.IMAGE_NAME || "").trim();
+            const imageNameInput = String(process.env.IMAGE_NAME || "").trim();
             const prNumbersInput = String(process.env.PR_NUMBERS || "").trim();
             const dryRun = String(process.env.DRY_RUN || "true").toLowerCase() === "true";
             const olderThanDaysInput = String(process.env.OLDER_THAN_DAYS || "7").trim();
@@ -62,6 +52,18 @@ jobs:
             const olderThanDays = Number.parseInt(olderThanDaysInput, 10);
             const cutoffMs = Date.now() - olderThanDays * 24 * 60 * 60 * 1000;
             const cutoffIso = new Date(cutoffMs).toISOString();
+
+            let imageName = imageNameInput;
+            if (!imageName) {
+              const repoName = String(context.repo.repo || "").trim();
+              if (!repoName) {
+                throw new Error(
+                  "Could not resolve image_name. Provide image_name directly."
+                );
+              }
+              imageName = `ghcr.io/JWilson45/${repoName}`;
+              core.info(`Resolved image_name to ${imageName}`);
+            }
 
             if (!imageName.startsWith("ghcr.io/")) {
               throw new Error(`image_name must start with ghcr.io/. Received: ${imageName}`);
