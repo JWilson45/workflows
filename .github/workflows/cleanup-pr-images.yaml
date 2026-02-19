@@ -1,0 +1,293 @@
+name: Cleanup GHCR PR Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_name:
+        description: "GHCR image name (e.g. ghcr.io/org/repo)"
+        required: true
+        type: string
+      pr_numbers:
+        description: "Optional comma-separated PR numbers (e.g. 123,456). Leave blank to target all PR-tagged images."
+        required: false
+        default: ""
+        type: string
+      dry_run:
+        description: "If true, only preview what would be deleted."
+        required: true
+        default: true
+        type: boolean
+      older_than_days:
+        description: "Only delete PR image versions older than this many days."
+        required: true
+        default: 7
+        type: number
+
+jobs:
+  cleanup-pr-images:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Cleanup PR images from GHCR
+        uses: actions/github-script@v7
+        env:
+          IMAGE_NAME: ${{ inputs.image_name }}
+          PR_NUMBERS: ${{ inputs.pr_numbers }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          OLDER_THAN_DAYS: ${{ inputs.older_than_days }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const imageName = String(process.env.IMAGE_NAME || "").trim();
+            const prNumbersInput = String(process.env.PR_NUMBERS || "").trim();
+            const dryRun = String(process.env.DRY_RUN || "true").toLowerCase() === "true";
+            const olderThanDaysInput = String(process.env.OLDER_THAN_DAYS || "7").trim();
+
+            if (!/^\d+$/.test(olderThanDaysInput)) {
+              throw new Error(`older_than_days must be a non-negative integer. Received: ${olderThanDaysInput}`);
+            }
+            const olderThanDays = Number.parseInt(olderThanDaysInput, 10);
+            const cutoffMs = Date.now() - olderThanDays * 24 * 60 * 60 * 1000;
+            const cutoffIso = new Date(cutoffMs).toISOString();
+
+            if (!imageName.startsWith("ghcr.io/")) {
+              throw new Error(`image_name must start with ghcr.io/. Received: ${imageName}`);
+            }
+
+            const imagePath = imageName.replace(/^ghcr\.io\//, "");
+            const firstSlash = imagePath.indexOf("/");
+            if (firstSlash <= 0 || firstSlash === imagePath.length - 1) {
+              throw new Error(`image_name must look like ghcr.io/<owner>/<package>. Received: ${imageName}`);
+            }
+
+            const owner = imagePath.slice(0, firstSlash);
+            let packageName = imagePath.slice(firstSlash + 1);
+            if (packageName.includes("@")) {
+              packageName = packageName.split("@", 1)[0];
+            }
+            if (packageName.includes(":")) {
+              packageName = packageName.split(":", 1)[0];
+            }
+
+            const selectedPrs = new Set();
+            if (prNumbersInput.length > 0) {
+              for (const raw of prNumbersInput.split(",")) {
+                const pr = raw.trim();
+                if (!pr) {
+                  continue;
+                }
+                if (!/^\d+$/.test(pr)) {
+                  throw new Error(`Invalid PR number "${pr}". Use comma-separated integers, e.g. 123,456`);
+                }
+                selectedPrs.add(pr);
+              }
+              if (selectedPrs.size === 0) {
+                throw new Error("pr_numbers was provided but no valid PR numbers were parsed.");
+              }
+            }
+
+            const prTagPattern = /-pr(\d+)-[0-9a-f]{7,}$/i;
+            const extractPrFromTag = (tag) => {
+              const match = String(tag || "").match(prTagPattern);
+              return match ? match[1] : null;
+            };
+
+            const listVersionsForOrg = () =>
+              github.paginate(
+                github.rest.packages.getAllPackageVersionsForPackageOwnedByOrg,
+                {
+                  org: owner,
+                  package_type: "container",
+                  package_name: packageName,
+                  per_page: 100,
+                }
+              );
+
+            const listVersionsForUser = () =>
+              github.paginate(
+                github.rest.packages.getAllPackageVersionsForPackageOwnedByUser,
+                {
+                  username: owner,
+                  package_type: "container",
+                  package_name: packageName,
+                  per_page: 100,
+                }
+              );
+
+            let ownerScope = "org";
+            let versions = [];
+            try {
+              versions = await listVersionsForOrg();
+            } catch (error) {
+              if (error.status === 404 || error.status === 422) {
+                try {
+                  ownerScope = "user";
+                  versions = await listVersionsForUser();
+                } catch (userError) {
+                  throw new Error(
+                    `Unable to list GHCR package versions for ${owner}/${packageName}. ` +
+                      `Tried org and user package scopes. Last error: ${userError.message}`
+                  );
+                }
+              } else if (error.status === 403) {
+                throw new Error(
+                  `Forbidden while listing GHCR package versions for ${owner}/${packageName}. ` +
+                    `Ensure this repository has package admin access and GITHUB_TOKEN can manage package versions.`
+                );
+              } else {
+                throw error;
+              }
+            }
+
+            const candidates = [];
+            const protectedMixedTags = [];
+            const skippedBySelection = [];
+            const skippedByAge = [];
+            const skippedNoTimestamp = [];
+
+            for (const version of versions) {
+              const tags = version?.metadata?.container?.tags || [];
+              if (!Array.isArray(tags) || tags.length === 0) {
+                continue;
+              }
+
+              const extractedPrs = tags.map((tag) => extractPrFromTag(tag));
+              const hasPrTag = extractedPrs.some(Boolean);
+              const allPrTags = extractedPrs.every(Boolean);
+              if (!hasPrTag) {
+                continue;
+              }
+
+              if (!allPrTags) {
+                protectedMixedTags.push({
+                  id: version.id,
+                  tags,
+                });
+                continue;
+              }
+
+              const versionPrs = [...new Set(extractedPrs)];
+              const matchesSelection =
+                selectedPrs.size === 0
+                  ? true
+                  : versionPrs.every((pr) => selectedPrs.has(pr));
+
+              if (!matchesSelection) {
+                if (selectedPrs.size > 0 && versionPrs.some((pr) => selectedPrs.has(pr))) {
+                  skippedBySelection.push({
+                    id: version.id,
+                    tags,
+                    prs: versionPrs,
+                  });
+                }
+                continue;
+              }
+
+              const timestamp = version?.updated_at || version?.created_at;
+              if (!timestamp) {
+                skippedNoTimestamp.push({
+                  id: version.id,
+                  tags,
+                  prs: versionPrs,
+                });
+                continue;
+              }
+
+              const timestampMs = Date.parse(timestamp);
+              if (Number.isNaN(timestampMs)) {
+                skippedNoTimestamp.push({
+                  id: version.id,
+                  tags,
+                  prs: versionPrs,
+                });
+                continue;
+              }
+
+              if (timestampMs >= cutoffMs) {
+                skippedByAge.push({
+                  id: version.id,
+                  tags,
+                  prs: versionPrs,
+                  updatedAt: timestamp,
+                });
+                continue;
+              }
+
+              candidates.push({
+                id: version.id,
+                tags,
+                prs: versionPrs,
+                updatedAt: timestamp,
+              });
+            }
+
+            const deleteVersion = async (versionId) => {
+              if (ownerScope === "org") {
+                return github.rest.packages.deletePackageVersionForOrg({
+                  org: owner,
+                  package_type: "container",
+                  package_name: packageName,
+                  package_version_id: versionId,
+                });
+              }
+              return github.rest.packages.deletePackageVersionForUser({
+                username: owner,
+                package_type: "container",
+                package_name: packageName,
+                package_version_id: versionId,
+              });
+            };
+
+            const deleted = [];
+            const failed = [];
+            for (const candidate of candidates) {
+              if (dryRun) {
+                core.info(
+                  `[dry-run] Would delete version ${candidate.id} (${candidate.tags.join(", ")}) ` +
+                    `updated_at=${candidate.updatedAt}`
+                );
+                continue;
+              }
+
+              try {
+                await deleteVersion(candidate.id);
+                deleted.push(candidate);
+                core.info(
+                  `Deleted version ${candidate.id} (${candidate.tags.join(", ")}) ` +
+                    `updated_at=${candidate.updatedAt}`
+                );
+              } catch (error) {
+                failed.push({
+                  id: candidate.id,
+                  tags: candidate.tags,
+                  error: error.message,
+                });
+                core.warning(`Failed to delete version ${candidate.id}: ${error.message}`);
+              }
+            }
+
+            const selectedText =
+              selectedPrs.size > 0 ? [...selectedPrs].sort((a, b) => Number(a) - Number(b)).join(", ") : "ALL";
+
+            await core.summary
+              .addHeading("GHCR PR image cleanup")
+              .addRaw(`Image: \`${owner}/${packageName}\`\n`)
+              .addRaw(`Mode: \`${dryRun ? "dry-run" : "delete"}\`\n`)
+              .addRaw(`Selection: \`${selectedText}\`\n`)
+              .addRaw(`Older than days: \`${olderThanDays}\`\n`)
+              .addRaw(`Cutoff (UTC): \`${cutoffIso}\`\n`)
+              .addRaw(`Versions scanned: \`${versions.length}\`\n`)
+              .addRaw(`Candidates: \`${candidates.length}\`\n`)
+              .addRaw(`Deleted: \`${deleted.length}\`\n`)
+              .addRaw(`Failed: \`${failed.length}\`\n`)
+              .addRaw(`Protected (mixed PR/non-PR tags): \`${protectedMixedTags.length}\`\n`)
+              .addRaw(`Skipped (partial selection overlap): \`${skippedBySelection.length}\`\n`)
+              .addRaw(`Skipped (newer than cutoff): \`${skippedByAge.length}\`\n`)
+              .addRaw(`Skipped (missing/invalid timestamp): \`${skippedNoTimestamp.length}\`\n`)
+              .write();
+
+            if (!dryRun && failed.length > 0) {
+              core.setFailed(`Failed to delete ${failed.length} package version(s). Check logs for details.`);
+            }
