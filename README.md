@@ -24,6 +24,8 @@ To create a release:
 
 - `.github/workflows/cleanup-pr-images.yaml` – Manually triggered workflow that removes PR-tagged GHCR container versions. It supports deleting all PR images for a package or only specific PR numbers, with a `dry-run` preview mode.
 
+- `.github/workflows/cleanup-pr-images-weekly.yaml` – Weekly scheduler that dispatches the cleanup workflow with fixed inputs for micromarketing images and no approval gate.
+
 - `.github/workflows/release.yaml` – Manages version bumps and publishes releases for this repository's reusable workflows.
 
 ## Helm deployments
@@ -60,10 +62,17 @@ Use *Actions -> Cleanup GHCR PR Images* to clean up PR images that were created 
 - default image when blank: `ghcr.io/JWilson45/<repo>`
 - `pr_numbers` (optional): comma-separated PR numbers, for example `123,456`; leave blank to target all PR images
 - `older_than_days` (default `7`): only delete PR image versions older than this many days
+- `require_approval` (default `true`): when true, stage 2 uses environment `delete`
 - note: IDs like `652340938` in logs are GHCR package version IDs (not PR numbers)
 - permissions: delete requires package admin access for the token on the target package
 - stage 1 builds a dry-run delete plan and uploads `delete-plan` artifact
 - manual stage 2 runs in environment `delete` (approval gate)
-- weekly cron runs every Sunday at 07:00 UTC for:
-  `ghcr.io/JWilson45/mmmodern-web,ghcr.io/JWilson45/mmmodern-api,ghcr.io/JWilson45/mm`
-- cron stage 2 does not require environment approval
+
+## Weekly scheduled cleanup
+
+`cleanup-pr-images-weekly.yaml` runs every Sunday at 16:20 UTC and dispatches `cleanup-pr-images.yaml` with:
+
+- `image_name`: `ghcr.io/JWilson45/mmmodern-web,ghcr.io/JWilson45/mmmodern-api,ghcr.io/JWilson45/mm`
+- `pr_numbers`: blank (all PR images)
+- `older_than_days`: `7`
+- `require_approval`: `false`

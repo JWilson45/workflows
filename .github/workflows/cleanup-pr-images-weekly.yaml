@@ -1,0 +1,33 @@
+name: Cleanup GHCR PR Images Weekly
+
+on:
+  schedule:
+    - cron: "20 16 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  dispatch-cleanup:
+    runs-on: workflows-runner-set
+    steps:
+      - name: Dispatch cleanup workflow with weekly inputs
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: "cleanup-pr-images.yaml",
+              ref: context.ref_name,
+              inputs: {
+                image_name: "ghcr.io/JWilson45/mmmodern-web,ghcr.io/JWilson45/mmmodern-api,ghcr.io/JWilson45/mm",
+                pr_numbers: "",
+                older_than_days: "7",
+                require_approval: "false",
+              },
+            });
+            core.info("Dispatched cleanup-pr-images.yaml with weekly inputs.");
