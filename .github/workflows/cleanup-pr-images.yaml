@@ -26,7 +26,7 @@ on:
 
 jobs:
   cleanup-pr-images:
-    runs-on: ubuntu-latest
+    runs-on: workflows-runner-set
     permissions:
       contents: read
       packages: write
