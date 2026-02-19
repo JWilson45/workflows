@@ -4,15 +4,26 @@ on:
   workflow_dispatch:
     inputs:
       image_name:
-        description: "GHCR image name (e.g. ghcr.io/org/repo)"
+        description: "Optional full GHCR image name (e.g. ghcr.io/org/repo). If empty, uses ghcr.io/<ghcr_owner>/<ghcr_package|repo-name>."
+        required: false
+        default: ""
+        type: string
+      ghcr_owner:
+        description: "Default GHCR owner/org when image_name is not provided."
         required: true
+        default: "JWilson45"
+        type: string
+      ghcr_package:
+        description: "Optional GHCR package name when image_name is not provided. Defaults to current repository name."
+        required: false
+        default: ""
         type: string
       pr_numbers:
         description: "Optional comma-separated PR numbers (e.g. 123,456). Leave blank to target all PR-tagged images."
         required: false
         default: ""
         type: string
-      dry_run:
+      dry-run:
         description: "If true, only preview what would be deleted."
         required: true
         default: true
