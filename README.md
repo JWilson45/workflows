@@ -22,6 +22,8 @@ To create a release:
 
 - `.github/workflows/build-and-deploy.yaml` – Builds and pushes a container image to GitHub Container Registry (GHCR), can deploy the image to Kubernetes clusters, and creates a GitHub Release for the calling project. For pull request builds, the image tag is suffixed as `${version}-pr${number}-${sha}` and the `latest` tag is not updated.
 
+- `.github/workflows/cleanup-pr-images.yaml` – Manually triggered workflow that removes PR-tagged GHCR container versions. It supports deleting all PR images for a package or only specific PR numbers, with a `dry-run` preview mode.
+
 - `.github/workflows/release.yaml` – Manages version bumps and publishes releases for this repository's reusable workflows.
 
 ## Helm deployments
@@ -49,3 +51,19 @@ jobs:
     secrets:
       kubeconfig_b64: ${{ secrets.KUBECONFIG_B64 }}
 ```
+
+## GHCR PR image cleanup
+
+Use *Actions -> Cleanup GHCR PR Images* to clean up PR images that were created by the build workflow.
+
+- `image_name` (optional): one or more images, comma-separated (for example `ghcr.io/org/repo-a,ghcr.io/org/repo-b`)
+- default image when blank: `ghcr.io/JWilson45/<repo>`
+- `pr_numbers` (optional): comma-separated PR numbers, for example `123,456`; leave blank to target all PR images
+- `older_than_days` (default `7`): only delete PR image versions older than this many days
+- note: IDs like `652340938` in logs are GHCR package version IDs (not PR numbers)
+- permissions: delete requires package admin access for the token on the target package
+- stage 1 builds a dry-run delete plan and uploads `delete-plan` artifact
+- manual stage 2 runs in environment `delete` (approval gate)
+- weekly cron runs every Sunday at 07:00 UTC for:
+  `ghcr.io/JWilson45/mmmodern-web,ghcr.io/JWilson45/mmmodern-api,ghcr.io/JWilson45/mm`
+- cron stage 2 does not require environment approval

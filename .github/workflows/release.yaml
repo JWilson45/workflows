@@ -100,13 +100,16 @@ jobs:
       - name: Create GitHub release
         id: create_release
         uses: actions/github-script@v8
+        env:
+          VERSION: ${{ steps.validate.outputs.version }}
+          NOTES: ${{ inputs.notes }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           result-encoding: string
           script: |
             const { execSync } = require("child_process");
-            const version = '${{ steps.validate.outputs.version }}';
-            const notes = `${{ inputs.notes }}` || "";
+            const version = process.env.VERSION;
+            const notes = process.env.NOTES || "";
             const prerelease = Boolean(${{ inputs.prerelease }});
             const owner = context.repo.owner;
             const repo = context.repo.repo;
