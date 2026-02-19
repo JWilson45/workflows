@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       image_name:
-        description: "Image (default: ghcr.io/JWilson45/<repo>)"
+        description: "Image(s), comma-separated (blank = ghcr.io/JWilson45/<repo>)"
         required: false
         default: ""
         type: string
@@ -23,6 +23,10 @@ on:
         required: true
         default: 7
         type: number
+
+permissions:
+  contents: read
+  packages: write
 
 jobs:
   cleanup-pr-images:
@@ -53,37 +57,6 @@ jobs:
             const cutoffMs = Date.now() - olderThanDays * 24 * 60 * 60 * 1000;
             const cutoffIso = new Date(cutoffMs).toISOString();
 
-            let imageName = imageNameInput;
-            if (!imageName) {
-              const repoName = String(context.repo.repo || "").trim();
-              if (!repoName) {
-                throw new Error(
-                  "Could not resolve image_name. Provide image_name directly."
-                );
-              }
-              imageName = `ghcr.io/JWilson45/${repoName}`;
-              core.info(`Resolved image_name to ${imageName}`);
-            }
-
-            if (!imageName.startsWith("ghcr.io/")) {
-              throw new Error(`image_name must start with ghcr.io/. Received: ${imageName}`);
-            }
-
-            const imagePath = imageName.replace(/^ghcr\.io\//, "");
-            const firstSlash = imagePath.indexOf("/");
-            if (firstSlash <= 0 || firstSlash === imagePath.length - 1) {
-              throw new Error(`image_name must look like ghcr.io/<owner>/<package>. Received: ${imageName}`);
-            }
-
-            const owner = imagePath.slice(0, firstSlash);
-            let packageName = imagePath.slice(firstSlash + 1);
-            if (packageName.includes("@")) {
-              packageName = packageName.split("@", 1)[0];
-            }
-            if (packageName.includes(":")) {
-              packageName = packageName.split(":", 1)[0];
-            }
-
             const selectedPrs = new Set();
             if (prNumbersInput.length > 0) {
               for (const raw of prNumbersInput.split(",")) {
@@ -101,206 +74,282 @@ jobs:
               }
             }
 
+            const imageNames = [];
+            if (!imageNameInput) {
+              const repoName = String(context.repo.repo || "").trim();
+              if (!repoName) {
+                throw new Error("Could not resolve image_name. Provide image_name directly.");
+              }
+              imageNames.push(`ghcr.io/JWilson45/${repoName}`);
+            } else {
+              for (const raw of imageNameInput.split(",")) {
+                const value = raw.trim();
+                if (value) {
+                  imageNames.push(value);
+                }
+              }
+              if (imageNames.length === 0) {
+                throw new Error("image_name was provided but no valid values were parsed.");
+              }
+            }
+
+            const uniqueImageNames = [...new Set(imageNames)];
             const prTagPattern = /-pr(\d+)-[0-9a-f]{7,}$/i;
             const extractPrFromTag = (tag) => {
               const match = String(tag || "").match(prTagPattern);
               return match ? match[1] : null;
             };
 
-            const listVersionsForOrg = () =>
-              github.paginate(
-                github.rest.packages.getAllPackageVersionsForPackageOwnedByOrg,
-                {
-                  org: owner,
-                  package_type: "container",
-                  package_name: packageName,
-                  per_page: 100,
-                }
-              );
-
-            const listVersionsForUser = () =>
-              github.paginate(
-                github.rest.packages.getAllPackageVersionsForPackageOwnedByUser,
-                {
-                  username: owner,
-                  package_type: "container",
-                  package_name: packageName,
-                  per_page: 100,
-                }
-              );
-
-            let ownerScope = "org";
-            let versions = [];
-            try {
-              versions = await listVersionsForOrg();
-            } catch (error) {
-              if (error.status === 404 || error.status === 422) {
-                try {
-                  ownerScope = "user";
-                  versions = await listVersionsForUser();
-                } catch (userError) {
-                  throw new Error(
-                    `Unable to list GHCR package versions for ${owner}/${packageName}. ` +
-                      `Tried org and user package scopes. Last error: ${userError.message}`
-                  );
-                }
-              } else if (error.status === 403) {
-                throw new Error(
-                  `Forbidden while listing GHCR package versions for ${owner}/${packageName}. ` +
-                    `Ensure this repository has package admin access and GITHUB_TOKEN can manage package versions.`
-                );
-              } else {
-                throw error;
-              }
-            }
-
-            const candidates = [];
-            const protectedMixedTags = [];
-            const skippedBySelection = [];
-            const skippedByAge = [];
-            const skippedNoTimestamp = [];
-
-            for (const version of versions) {
-              const tags = version?.metadata?.container?.tags || [];
-              if (!Array.isArray(tags) || tags.length === 0) {
-                continue;
-              }
-
-              const extractedPrs = tags.map((tag) => extractPrFromTag(tag));
-              const hasPrTag = extractedPrs.some(Boolean);
-              const allPrTags = extractedPrs.every(Boolean);
-              if (!hasPrTag) {
-                continue;
-              }
-
-              if (!allPrTags) {
-                protectedMixedTags.push({
-                  id: version.id,
-                  tags,
-                });
-                continue;
-              }
-
-              const versionPrs = [...new Set(extractedPrs)];
-              const matchesSelection =
-                selectedPrs.size === 0
-                  ? true
-                  : versionPrs.every((pr) => selectedPrs.has(pr));
-
-              if (!matchesSelection) {
-                if (selectedPrs.size > 0 && versionPrs.some((pr) => selectedPrs.has(pr))) {
-                  skippedBySelection.push({
-                    id: version.id,
-                    tags,
-                    prs: versionPrs,
-                  });
-                }
-                continue;
-              }
-
-              const timestamp = version?.updated_at || version?.created_at;
-              if (!timestamp) {
-                skippedNoTimestamp.push({
-                  id: version.id,
-                  tags,
-                  prs: versionPrs,
-                });
-                continue;
-              }
-
-              const timestampMs = Date.parse(timestamp);
-              if (Number.isNaN(timestampMs)) {
-                skippedNoTimestamp.push({
-                  id: version.id,
-                  tags,
-                  prs: versionPrs,
-                });
-                continue;
-              }
-
-              if (timestampMs >= cutoffMs) {
-                skippedByAge.push({
-                  id: version.id,
-                  tags,
-                  prs: versionPrs,
-                  updatedAt: timestamp,
-                });
-                continue;
-              }
-
-              candidates.push({
-                id: version.id,
-                tags,
-                prs: versionPrs,
-                updatedAt: timestamp,
-              });
-            }
-
-            const deleteVersion = async (versionId) => {
-              if (ownerScope === "org") {
-                return github.rest.packages.deletePackageVersionForOrg({
-                  org: owner,
-                  package_type: "container",
-                  package_name: packageName,
-                  package_version_id: versionId,
-                });
-              }
-              return github.rest.packages.deletePackageVersionForUser({
-                username: owner,
-                package_type: "container",
-                package_name: packageName,
-                package_version_id: versionId,
-              });
-            };
-
-            const deleted = [];
-            const failed = [];
-            for (const candidate of candidates) {
-              if (dryRun) {
-                core.info(
-                  `[dry-run] Would delete version ${candidate.id} (${candidate.tags.join(", ")}) ` +
-                    `updated_at=${candidate.updatedAt}`
-                );
-                continue;
-              }
-
-              try {
-                await deleteVersion(candidate.id);
-                deleted.push(candidate);
-                core.info(
-                  `Deleted version ${candidate.id} (${candidate.tags.join(", ")}) ` +
-                    `updated_at=${candidate.updatedAt}`
-                );
-              } catch (error) {
-                failed.push({
-                  id: candidate.id,
-                  tags: candidate.tags,
-                  error: error.message,
-                });
-                core.warning(`Failed to delete version ${candidate.id}: ${error.message}`);
-              }
-            }
-
             const selectedText =
               selectedPrs.size > 0 ? [...selectedPrs].sort((a, b) => Number(a) - Number(b)).join(", ") : "ALL";
 
+            const results = [];
+            for (const imageName of uniqueImageNames) {
+              try {
+                if (!imageName.startsWith("ghcr.io/")) {
+                  throw new Error(`image_name must start with ghcr.io/. Received: ${imageName}`);
+                }
+
+                const imagePath = imageName.replace(/^ghcr\.io\//, "");
+                const firstSlash = imagePath.indexOf("/");
+                if (firstSlash <= 0 || firstSlash === imagePath.length - 1) {
+                  throw new Error(`image_name must look like ghcr.io/<owner>/<package>. Received: ${imageName}`);
+                }
+
+                const owner = imagePath.slice(0, firstSlash);
+                let packageName = imagePath.slice(firstSlash + 1);
+                if (packageName.includes("@")) {
+                  packageName = packageName.split("@", 1)[0];
+                }
+                if (packageName.includes(":")) {
+                  packageName = packageName.split(":", 1)[0];
+                }
+
+                const listVersionsForOrg = () =>
+                  github.paginate(
+                    github.rest.packages.getAllPackageVersionsForPackageOwnedByOrg,
+                    {
+                      org: owner,
+                      package_type: "container",
+                      package_name: packageName,
+                      per_page: 100,
+                    }
+                  );
+
+                const listVersionsForUser = () =>
+                  github.paginate(
+                    github.rest.packages.getAllPackageVersionsForPackageOwnedByUser,
+                    {
+                      username: owner,
+                      package_type: "container",
+                      package_name: packageName,
+                      per_page: 100,
+                    }
+                  );
+
+                let ownerScope = "org";
+                let versions = [];
+                try {
+                  versions = await listVersionsForOrg();
+                } catch (error) {
+                  if (error.status === 404 || error.status === 422) {
+                    ownerScope = "user";
+                    versions = await listVersionsForUser();
+                  } else if (error.status === 403) {
+                    throw new Error(
+                      `Forbidden while listing GHCR package versions for ${owner}/${packageName}. ` +
+                        `Ensure this repository has package admin access and GITHUB_TOKEN can manage package versions.`
+                    );
+                  } else {
+                    throw error;
+                  }
+                }
+
+                const candidates = [];
+                const protectedMixedTags = [];
+                const skippedBySelection = [];
+                const skippedByAge = [];
+                const skippedNoTimestamp = [];
+
+                for (const version of versions) {
+                  const tags = version?.metadata?.container?.tags || [];
+                  if (!Array.isArray(tags) || tags.length === 0) {
+                    continue;
+                  }
+
+                  const extractedPrs = tags.map((tag) => extractPrFromTag(tag));
+                  const hasPrTag = extractedPrs.some(Boolean);
+                  const allPrTags = extractedPrs.every(Boolean);
+                  if (!hasPrTag) {
+                    continue;
+                  }
+
+                  if (!allPrTags) {
+                    protectedMixedTags.push({ id: version.id, tags });
+                    continue;
+                  }
+
+                  const versionPrs = [...new Set(extractedPrs)];
+                  const matchesSelection =
+                    selectedPrs.size === 0
+                      ? true
+                      : versionPrs.every((pr) => selectedPrs.has(pr));
+
+                  if (!matchesSelection) {
+                    if (selectedPrs.size > 0 && versionPrs.some((pr) => selectedPrs.has(pr))) {
+                      skippedBySelection.push({ id: version.id, tags, prs: versionPrs });
+                    }
+                    continue;
+                  }
+
+                  const timestamp = version?.updated_at || version?.created_at;
+                  if (!timestamp) {
+                    skippedNoTimestamp.push({ id: version.id, tags, prs: versionPrs });
+                    continue;
+                  }
+
+                  const timestampMs = Date.parse(timestamp);
+                  if (Number.isNaN(timestampMs)) {
+                    skippedNoTimestamp.push({ id: version.id, tags, prs: versionPrs });
+                    continue;
+                  }
+
+                  if (timestampMs >= cutoffMs) {
+                    skippedByAge.push({ id: version.id, tags, prs: versionPrs, updatedAt: timestamp });
+                    continue;
+                  }
+
+                  candidates.push({ id: version.id, tags, prs: versionPrs, updatedAt: timestamp });
+                }
+
+                const deleteVersion = async (versionId) => {
+                  const scopes = ownerScope === "org" ? ["org", "user"] : ["user", "org"];
+                  let lastError = null;
+                  for (const scope of scopes) {
+                    try {
+                      if (scope === "org") {
+                        await github.rest.packages.deletePackageVersionForOrg({
+                          org: owner,
+                          package_type: "container",
+                          package_name: packageName,
+                          package_version_id: versionId,
+                        });
+                      } else {
+                        await github.rest.packages.deletePackageVersionForUser({
+                          username: owner,
+                          package_type: "container",
+                          package_name: packageName,
+                          package_version_id: versionId,
+                        });
+                      }
+                      return;
+                    } catch (error) {
+                      lastError = error;
+                      if (error.status !== 404 && error.status !== 422) {
+                        throw error;
+                      }
+                    }
+                  }
+
+                  throw new Error(
+                    `Delete failed in both owner scopes (org/user). ` +
+                      `This usually means the token lacks package admin permission. ` +
+                      `Last status=${lastError?.status || "unknown"} message=${lastError?.message || "unknown"}`
+                  );
+                };
+
+                const deleted = [];
+                const failed = [];
+                for (const candidate of candidates) {
+                  if (dryRun) {
+                    core.info(
+                      `[dry-run] [${owner}/${packageName}] Would delete version ${candidate.id} (${candidate.tags.join(", ")}) ` +
+                        `updated_at=${candidate.updatedAt}`
+                    );
+                    continue;
+                  }
+
+                  try {
+                    await deleteVersion(candidate.id);
+                    deleted.push(candidate);
+                    core.info(
+                      `[${owner}/${packageName}] Deleted version ${candidate.id} (${candidate.tags.join(", ")}) ` +
+                        `updated_at=${candidate.updatedAt}`
+                    );
+                  } catch (error) {
+                    failed.push({
+                      id: candidate.id,
+                      tags: candidate.tags,
+                      error: error.message,
+                      status: error.status || null,
+                    });
+                    core.warning(
+                      `[${owner}/${packageName}] Failed to delete version ${candidate.id}: ` +
+                        `status=${error.status || "unknown"} ${error.message}`
+                    );
+                  }
+                }
+
+                results.push({
+                  image: `${owner}/${packageName}`,
+                  versionsScanned: versions.length,
+                  candidates: candidates.length,
+                  deleted: deleted.length,
+                  failed: failed.length,
+                  protectedMixed: protectedMixedTags.length,
+                  skippedBySelection: skippedBySelection.length,
+                  skippedByAge: skippedByAge.length,
+                  skippedNoTimestamp: skippedNoTimestamp.length,
+                  error: null,
+                });
+              } catch (error) {
+                results.push({
+                  image: imageName,
+                  versionsScanned: 0,
+                  candidates: 0,
+                  deleted: 0,
+                  failed: 0,
+                  protectedMixed: 0,
+                  skippedBySelection: 0,
+                  skippedByAge: 0,
+                  skippedNoTimestamp: 0,
+                  error: error.message,
+                });
+                core.warning(`[${imageName}] ${error.message}`);
+              }
+            }
+
             await core.summary
               .addHeading("GHCR PR image cleanup")
-              .addRaw(`Image: \`${owner}/${packageName}\`\n`)
+              .addRaw(`Images: \`${uniqueImageNames.join(", ")}\`\n`)
               .addRaw(`Mode: \`${dryRun ? "dry-run" : "delete"}\`\n`)
               .addRaw(`Selection: \`${selectedText}\`\n`)
               .addRaw(`Older than days: \`${olderThanDays}\`\n`)
-              .addRaw(`Cutoff (UTC): \`${cutoffIso}\`\n`)
-              .addRaw(`Versions scanned: \`${versions.length}\`\n`)
-              .addRaw(`Candidates: \`${candidates.length}\`\n`)
-              .addRaw(`Deleted: \`${deleted.length}\`\n`)
-              .addRaw(`Failed: \`${failed.length}\`\n`)
-              .addRaw(`Protected (mixed PR/non-PR tags): \`${protectedMixedTags.length}\`\n`)
-              .addRaw(`Skipped (partial selection overlap): \`${skippedBySelection.length}\`\n`)
-              .addRaw(`Skipped (newer than cutoff): \`${skippedByAge.length}\`\n`)
-              .addRaw(`Skipped (missing/invalid timestamp): \`${skippedNoTimestamp.length}\`\n`)
-              .write();
+              .addRaw(`Cutoff (UTC): \`${cutoffIso}\`\n\n`);
 
-            if (!dryRun && failed.length > 0) {
-              core.setFailed(`Failed to delete ${failed.length} package version(s). Check logs for details.`);
+            for (const result of results) {
+              core.summary
+                .addRaw(`### ${result.image}\n`)
+                .addRaw(`Versions scanned: \`${result.versionsScanned}\`\n`)
+                .addRaw(`Candidates: \`${result.candidates}\`\n`)
+                .addRaw(`Deleted: \`${result.deleted}\`\n`)
+                .addRaw(`Failed: \`${result.failed}\`\n`)
+                .addRaw(`Protected (mixed PR/non-PR tags): \`${result.protectedMixed}\`\n`)
+                .addRaw(`Skipped (partial selection overlap): \`${result.skippedBySelection}\`\n`)
+                .addRaw(`Skipped (newer than cutoff): \`${result.skippedByAge}\`\n`)
+                .addRaw(`Skipped (missing/invalid timestamp): \`${result.skippedNoTimestamp}\`\n`);
+              if (result.error) {
+                core.summary.addRaw(`Error: \`${result.error}\`\n`);
+              }
+              core.summary.addRaw(`\n`);
+            }
+
+            await core.summary.write();
+
+            const totalFailedDeletes = results.reduce((sum, r) => sum + r.failed, 0);
+            const imageErrors = results.filter((r) => Boolean(r.error));
+            if (imageErrors.length > 0) {
+              core.setFailed(`Failed to process ${imageErrors.length} image(s). Check logs/summary.`);
+            } else if (!dryRun && totalFailedDeletes > 0) {
+              core.setFailed(`Failed to delete ${totalFailedDeletes} package version(s). Check logs/summary.`);
             }
