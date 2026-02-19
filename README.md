@@ -67,6 +67,9 @@ Use *Actions -> Cleanup GHCR PR Images* to clean up PR images that were created 
 - permissions: delete requires package admin access for the token on the target package
 - stage 1 builds a dry-run delete plan and uploads `delete-plan` artifact
 - manual stage 2 runs in environment `delete` (approval gate)
+- implementation files:
+  `.github/scripts/ghcr-cleanup/plan.js`,
+  `.github/scripts/ghcr-cleanup/delete.js`
 
 ## Weekly scheduled cleanup
 
