@@ -26,14 +26,6 @@ on:
         required: false
         default: "default"
         type: string
-      # kube_deployment:
-      #   description: "Kubernetes deployment name"
-      #   required: false
-      #   type: string
-      # kube_container:
-      #   description: "Container name inside the deployment"
-      #   required: false
-      #   type: string
       do_deploy:
         description: "Whether to deploy after build"
         required: false
@@ -240,21 +232,6 @@ jobs:
           cache-to: |
             type=gha,mode=max,scope=${{ inputs.image_name }}
 
-
-      # - name: Validate kubectl inputs
-      #   if: steps.flags.outputs.should_kubectl_deploy == 'true'
-      #   run: |
-      #     if [ -z "${{ inputs.kube_deployment }}" ] || [ -z "${{ inputs.kube_container }}" ]; then
-      #       echo "kube_deployment and kube_container are required when Helm is not enabled."
-      #       exit 1
-      #     fi
-
-      # - name: Install kubectl and load kubeconfig
-      #   if: steps.flags.outputs.should_kubectl_deploy == 'true'
-      #   uses: tale/kubectl-action@v1
-      #   with:
-      #     base64-kube-config: ${{ secrets.kubeconfig_b64 }}
-
       - name: Set up Helm
         if: steps.flags.outputs.should_helm_deploy == 'true'
         uses: azure/setup-helm@v4
@@ -287,15 +264,8 @@ jobs:
             "${{ inputs.helm_chart }}" \
             $VALUES_ARG \
             -n "${{ inputs.kube_namespace }}" \
-            --atomic \
+            --rollback-on-failure \
             --wait \
-            --timeout 10m \
-            --history-max 10 \
+            --timeout 3m \
+            --history-max 5 \
             $SET_ARGS
-
-      # - name: Set image tag & apply
-      #   if: steps.flags.outputs.should_kubectl_deploy == 'true'
-      #   run: |
-      #     kubectl set image -n ${{ inputs.kube_namespace }} \
-      #       deployment/${{ inputs.kube_deployment }} \
-      #       ${{ inputs.kube_container }}=${{ inputs.image_name }}:${{ steps.version.outputs.image_tag }}
