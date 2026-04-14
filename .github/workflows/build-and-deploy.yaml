@@ -21,10 +21,10 @@ on:
         required: false
         default: "linux/amd64"
         type: string
-      buildx_builder:
-        description: "Existing Buildx builder name to use"
+      buildkit_namespace:
+        description: "Kubernetes namespace where Buildx Kubernetes-driver builders run"
         required: false
-        default: "kube"
+        default: "buildkit"
         type: string
       kube_namespace:
         description: "Kubernetes namespace for deploy"
@@ -216,12 +216,43 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Load kubeconfig for Buildx
+        if: steps.flags.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.kubeconfig_b64 }}" | base64 --decode > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      - name: Create Buildx Kubernetes builder
+        if: steps.flags.outputs.should_build == 'true'
+        id: buildx
+        shell: bash
+        run: |
+          BUILDER_NAME="kube-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "builder_name=$BUILDER_NAME" >> "$GITHUB_OUTPUT"
+
+          docker buildx create \
+            --name "$BUILDER_NAME" \
+            --driver kubernetes \
+            --platform linux/arm64 \
+            --driver-opt "namespace=${{ inputs.buildkit_namespace }},rootless=true,nodeselector=kubernetes.io/arch=arm64"
+
+          docker buildx create \
+            --name "$BUILDER_NAME" \
+            --append \
+            --platform linux/amd64 \
+            --driver kubernetes \
+            --driver-opt "namespace=${{ inputs.buildkit_namespace }},rootless=true,nodeselector=kubernetes.io/arch=amd64"
+
+          docker buildx inspect "$BUILDER_NAME" --bootstrap
+
       - name: Build & push multi-arch image
         if: steps.flags.outputs.should_build == 'true'
         id: build
         uses: docker/build-push-action@v7
         with:
-          builder: ${{ inputs.buildx_builder }}
+          builder: ${{ steps.buildx.outputs.builder_name }}
           context: .
           file: ${{ inputs.dockerfile }}
           platforms: ${{ inputs.platforms }}
@@ -233,6 +264,12 @@ jobs:
             type=gha,scope=${{ inputs.image_name }}
           cache-to: |
             type=gha,mode=max,scope=${{ inputs.image_name }}
+
+      - name: Remove Buildx Kubernetes builder
+        if: always() && steps.flags.outputs.should_build == 'true'
+        shell: bash
+        run: |
+          docker buildx rm -f "${{ steps.buildx.outputs.builder_name }}" || true
 
       - name: Set up Helm
         if: steps.flags.outputs.should_helm_deploy == 'true'
