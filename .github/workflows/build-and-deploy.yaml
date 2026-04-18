@@ -1,87 +1,183 @@
-name: Reusable Build & Deploy
+name: Build & Deploy Images
 
 on:
   workflow_call:
     inputs:
-      image_name:
-        description: "Full image name (e.g. ghcr.io/org/repo)"
+      images_json:
         required: true
-        type: string
-      app_dir:
-        description: "Path to the app directory (contains package.json & Dockerfile)"
-        required: true
-        type: string
-      dockerfile:
-        description: "Path to Dockerfile (relative to repo root)"
-        required: false
-        default: "${{ inputs.app_dir }}/Dockerfile"
         type: string
       platforms:
-        description: "Platforms to build (comma-separated)"
         required: false
-        default: "linux/amd64"
+        default: linux/amd64
         type: string
       kube_namespace:
-        description: "Kubernetes namespace for deploy"
+        required: true
+        type: string
+      planning_runner_label:
         required: false
-        default: "default"
+        default: mm-runner-set-no-dind
+        type: string
+      build_runner_label:
+        required: false
+        default: mm-runner-set
+        type: string
+      helm_release:
+        required: true
+        type: string
+      helm_chart:
+        required: true
+        type: string
+      helm_values_file:
+        required: true
+        type: string
+      helm_timeout:
+        required: false
+        default: 3m
         type: string
       do_deploy:
-        description: "Whether to deploy after build"
         required: false
         default: true
         type: boolean
-      runner_label:
-        description: "Runner label to use (e.g. ubuntu-latest, mm-runner-set)"
-        required: false
-        default: "ubuntu-latest"
-        type: string
-      helm_release:
-        description: "Helm release name"
-        required: false
-        default: ""
-        type: string
-      helm_chart:
-        description: "Helm chart path or reference"
-        required: false
-        default: ""
-        type: string
-      helm_values_file:
-        description: "Helm values file path (optional, does NOT enable Helm by itself)"
-        required: false
-        default: ""
-        type: string
-      helm_image_tag_path:
-        description: "Helm values key for the image tag"
-        required: false
-        default: "image.tag"
-        type: string
-      helm_set:
-        description: "Additional Helm --set values (comma-separated, optional)"
-        required: false
-        default: ""
-        type: string
     secrets:
       kubeconfig_b64:
-        description: "Base64-encoded kubeconfig"
         required: true
 
 jobs:
-  build-and-deploy:
-    runs-on: ${{ inputs.runner_label }}
-    timeout-minutes: 25
+  plan:
+    runs-on: ${{ inputs.planning_runner_label }}
+    timeout-minutes: 10
     concurrency:
-      group: ${{ github.workflow }}-${{ github.ref }}
+      group: ${{ github.workflow }}-${{ inputs.helm_release }}-${{ github.ref }}
       cancel-in-progress: true
+    permissions:
+      contents: read
+    outputs:
+      build_matrix: ${{ steps.plan.outputs.build_matrix }}
+      helm_set_args: ${{ steps.plan.outputs.helm_set_args }}
+      should_build: ${{ steps.plan.outputs.should_build }}
+      should_deploy: ${{ steps.plan.outputs.should_deploy }}
+    env:
+      IMAGES_JSON: ${{ inputs.images_json }}
+      IS_MANUAL: ${{ github.event_name == 'workflow_dispatch' }}
+      IS_RERUN: ${{ github.run_attempt > 1 }}
+    steps:
+      - name: Plan image builds
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          images_file="$(mktemp)"
+          printf '%s' "$IMAGES_JSON" > "$images_file"
+          jq -e 'type == "array" and length > 0' "$images_file" >/dev/null
+
+          pr_number="${{ github.event.pull_request.number }}"
+          short_sha="$(echo "$GITHUB_SHA" | cut -c1-7)"
+          build_matrix='[]'
+          helm_set_args=''
+
+          check_tag() {
+            local image="$1"
+            local tag="$2"
+            local registry repo token status
+            registry="$(echo "$image" | cut -d'/' -f1)"
+            repo="$(echo "$image" | cut -d'/' -f2-)"
+            if [ -z "$registry" ] || [ -z "$repo" ] || [ "$registry" = "$image" ]; then
+              echo "image must be a full image reference like ghcr.io/org/repo. Got: $image" >&2
+              exit 1
+            fi
+            token="$(curl -s "https://$registry/token?scope=repository:$repo:pull" | jq -r .token)"
+            status="$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer $token" \
+              -H "Accept: application/vnd.oci.image.index.v1+json" \
+              "https://$registry/v2/$repo/manifests/$tag")"
+            [ "$status" = "200" ]
+          }
+
+          while IFS= read -r image_config; do
+            name="$(jq -r '.name // empty' <<< "$image_config")"
+            image="$(jq -r '.image // empty' <<< "$image_config")"
+            app_dir="$(jq -r '.appDir // empty' <<< "$image_config")"
+            docker_target="$(jq -r '.dockerTarget // empty' <<< "$image_config")"
+            helm_tag_path="$(jq -r '.helmTagPath // empty' <<< "$image_config")"
+
+            if [ -z "$name" ] || [ -z "$image" ] || [ -z "$app_dir" ] || [ -z "$docker_target" ] || [ -z "$helm_tag_path" ]; then
+              echo "Each image entry requires name, image, appDir, dockerTarget, and helmTagPath." >&2
+              echo "$image_config" >&2
+              exit 1
+            fi
+
+            registry="$(echo "$image" | cut -d'/' -f1)"
+            package_json="$(curl -fsSL \
+              -H "Authorization: Bearer ${{ github.token }}" \
+              -H "Accept: application/vnd.github.raw" \
+              "https://api.github.com/repos/${{ github.repository }}/contents/$app_dir/package.json?ref=${{ github.sha }}")"
+            version="$(jq -r '.version' <<< "$package_json")"
+
+            if [ -n "$pr_number" ]; then
+              image_tag="${version}-pr${pr_number}-${short_sha}"
+            else
+              image_tag="$version"
+            fi
+
+            tags="$image:$image_tag"
+            if [ -z "$pr_number" ]; then
+              tags="${tags}"$'\n'"$image:latest"
+            fi
+
+            if ! check_tag "$image" "$image_tag"; then
+              matrix_item="$(jq -cn \
+                --arg name "$name" \
+                --arg image "$image" \
+                --arg registry "$registry" \
+                --arg dockerTarget "$docker_target" \
+                --arg tags "$tags" \
+                --arg cacheScope "${image}-${docker_target}" \
+                '{name:$name,image:$image,registry:$registry,dockerTarget:$dockerTarget,tags:$tags,cacheScope:$cacheScope}')"
+              build_matrix="$(jq -c --argjson item "$matrix_item" '. + [$item]' <<< "$build_matrix")"
+            fi
+
+            if [ -n "$helm_set_args" ]; then
+              helm_set_args="${helm_set_args},"
+            fi
+            helm_set_args="${helm_set_args}${helm_tag_path}=${image_tag}"
+          done < <(jq -c '.[]' "$images_file")
+
+          should_build=false
+          if [ "$(jq 'length' <<< "$build_matrix")" -gt 0 ]; then
+            should_build=true
+          fi
+
+          operator_override=false
+          if [ "$IS_MANUAL" = "true" ] || [ "$IS_RERUN" = "true" ]; then
+            operator_override=true
+          fi
+
+          should_deploy=false
+          if [ "${{ inputs.do_deploy }}" = "true" ] && { [ "$should_build" = "true" ] || [ "$operator_override" = "true" ]; }; then
+            should_deploy=true
+          fi
+
+          echo "build_matrix=$build_matrix" >> "$GITHUB_OUTPUT"
+          echo "helm_set_args=$helm_set_args" >> "$GITHUB_OUTPUT"
+          echo "should_build=$should_build" >> "$GITHUB_OUTPUT"
+          echo "should_deploy=$should_deploy" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.image.name }}
+    needs: plan
+    if: needs.plan.outputs.should_build == 'true'
+    runs-on: ${{ inputs.build_runner_label }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJson(needs.plan.outputs.build_matrix) }}
     permissions:
       contents: read
       packages: write
       id-token: write
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-    env:
-      IS_MANUAL: ${{ github.event_name == 'workflow_dispatch' }}
-      IS_RERUN: ${{ github.run_attempt > 1 }}
+      attestations: write
     steps:
       - name: Checkout repo
         uses: actions/checkout@v6
@@ -89,155 +185,53 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Parse and validate image reference
-        id: image_ref
-        shell: bash
-        run: |
-          IMAGE_REF="${{ inputs.image_name }}"
-          REGISTRY="$(echo "$IMAGE_REF" | cut -d'/' -f1)"
-          REPO="$(echo "$IMAGE_REF" | cut -d'/' -f2-)"
-          if [ -z "$REGISTRY" ] || [ -z "$REPO" ] || [ "$REGISTRY" = "$IMAGE_REF" ]; then
-            echo "image_name must be a full image reference like ghcr.io/org/repo. Got: $IMAGE_REF" >&2
-            exit 1
-          fi
-          if [ "$REGISTRY" != "ghcr.io" ]; then
-            echo "Unsupported registry '$REGISTRY'. This reusable workflow currently supports ghcr.io only." >&2
-            exit 1
-          fi
-          echo "registry=$REGISTRY" >> "$GITHUB_OUTPUT"
-          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
-
-      - name: Extract version from package.json
-        id: version
-        run: |
-          ver=$(jq -r '.version' "${{ inputs.app_dir }}/package.json")
-          pr_number="${{ github.event.pull_request.number }}"
-          if [ -n "$pr_number" ]; then
-            sha=$(echo "${GITHUB_SHA}" | cut -c1-7)
-            image_tag="${ver}-pr${pr_number}-${sha}"
-          else
-            image_tag="$ver"
-          fi
-          echo "version=$ver" >> "$GITHUB_OUTPUT"
-          echo "image_tag=$image_tag" >> "$GITHUB_OUTPUT"
-          echo "tags<<EOF" >> "$GITHUB_OUTPUT"
-          echo "${{ inputs.image_name }}:$image_tag" >> "$GITHUB_OUTPUT"
-          if [ -z "$pr_number" ]; then
-            echo "${{ inputs.image_name }}:latest" >> "$GITHUB_OUTPUT"
-          fi
-          echo "EOF" >> "$GITHUB_OUTPUT"
-
-      - name: Check if image version exists in GHCR
-        id: image_exists
-        run: |
-          TAG="${{ steps.version.outputs.image_tag }}"
-          IMAGE_REF="${{ inputs.image_name }}"
-          REGISTRY="${{ steps.image_ref.outputs.registry }}"
-          REPO="${{ steps.image_ref.outputs.repo }}"
-          FULL_IMAGE="$IMAGE_REF:$TAG"
-          TOKEN=$(curl -s "https://$REGISTRY/token?scope=repository:$REPO:pull" | jq -r .token)
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: Bearer $TOKEN" \
-            -H "Accept: application/vnd.oci.image.index.v1+json" \
-            "https://$REGISTRY/v2/$REPO/manifests/$TAG")
-          echo "Got HTTP status: $STATUS"
-          if [ "$STATUS" = "200" ]; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Image $FULL_IMAGE already exists in GHCR. Skipping build and push." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Compute flags
-        id: flags
-        shell: bash
-        run: |
-          # Derived booleans used to simplify later step conditionals
-          use_helm=false
-          # Helm is enabled ONLY when an explicit Helm deploy is requested
-          # (helm_release + helm_chart define intent). helm_values_file is config-only.
-          if [ -n "${{ inputs.helm_chart }}" ] || [ -n "${{ inputs.helm_release }}" ]; then
-            use_helm=true
-          fi
-
-          should_build=false
-          if [ "${{ steps.image_exists.outputs.exists }}" = "false" ]; then
-            should_build=true
-          fi
-
-          is_override=false
-          # Treat manual dispatch OR a re-run attempt as an operator override.
-          if [ "${IS_MANUAL}" = "true" ] || [ "${IS_RERUN}" = "true" ]; then
-            is_override=true
-          fi
-
-          should_deploy=false
-          if [ "${{ inputs.do_deploy }}" = "true" ] && ( [ "$should_build" = "true" ] || [ "$is_override" = "true" ] ); then
-            should_deploy=true
-          fi
-
-          should_helm_deploy=false
-          if [ "$should_deploy" = "true" ] && [ "$use_helm" = "true" ]; then
-            should_helm_deploy=true
-          fi
-
-          should_kubectl_deploy=false
-          if [ "$should_deploy" = "true" ] && [ "$use_helm" = "false" ]; then
-            should_kubectl_deploy=true
-          fi
-
-          echo "use_helm=$use_helm" >> "$GITHUB_OUTPUT"
-          echo "should_build=$should_build" >> "$GITHUB_OUTPUT"
-          echo "should_deploy=$should_deploy" >> "$GITHUB_OUTPUT"
-          echo "should_helm_deploy=$should_helm_deploy" >> "$GITHUB_OUTPUT"
-          echo "should_kubectl_deploy=$should_kubectl_deploy" >> "$GITHUB_OUTPUT"
-
-      - name: Add skip message to workflow summary
-        if: steps.flags.outputs.should_build == 'false'
-        run: |
-          if [ "${IS_MANUAL}" = "true" ]; then
-            echo "### Skipped build & push: tag \`${{ steps.version.outputs.image_tag }}\` already exists. Deploying existing image (manual dispatch)." >> $GITHUB_STEP_SUMMARY
-          elif [ "${IS_RERUN}" = "true" ]; then
-            echo "### Skipped build & push: tag \`${{ steps.version.outputs.image_tag }}\` already exists. Deploying existing image (re-run attempt)." >> $GITHUB_STEP_SUMMARY
-          else
-            echo "### Skipped build & push: tag \`${{ steps.version.outputs.image_tag }}\` already exists." >> $GITHUB_STEP_SUMMARY
-          fi
-
       - name: Set up Docker Buildx
-        if: steps.flags.outputs.should_build == 'true'
         uses: docker/setup-buildx-action@v4
 
       - name: Log in to registry
-        if: steps.flags.outputs.should_build == 'true'
         uses: docker/login-action@v4
         with:
-          registry: ${{ steps.image_ref.outputs.registry }}
+          registry: ${{ matrix.image.registry }}
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ github.token }}
 
-      - name: Build & push multi-arch image
-        if: steps.flags.outputs.should_build == 'true'
-        id: build
+      - name: Build image
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: ${{ inputs.dockerfile }}
+          file: Dockerfile
+          target: ${{ matrix.image.dockerTarget }}
           platforms: ${{ inputs.platforms }}
           push: true
           provenance: mode=max
           sbom: true
-          tags: ${{ steps.version.outputs.tags }}
-          cache-from: |
-            type=gha,scope=${{ inputs.image_name }}
-          cache-to: |
-            type=gha,mode=max,scope=${{ inputs.image_name }}
+          tags: ${{ matrix.image.tags }}
+          cache-from: type=gha,scope=${{ matrix.image.cacheScope }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.cacheScope }}
+
+  deploy:
+    needs:
+      - plan
+      - build
+    if: >-
+      always() &&
+      needs.plan.outputs.should_deploy == 'true' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped')
+    runs-on: ${{ inputs.planning_runner_label }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Set up Helm
-        if: steps.flags.outputs.should_helm_deploy == 'true'
         uses: azure/setup-helm@v4
 
-      - name: Load kubeconfig for Helm
-        if: steps.flags.outputs.should_helm_deploy == 'true'
+      - name: Load kubeconfig
         shell: bash
         run: |
           mkdir -p "$HOME/.kube"
@@ -245,27 +239,15 @@ jobs:
           chmod 600 "$HOME/.kube/config"
 
       - name: Helm upgrade/install
-        if: steps.flags.outputs.should_helm_deploy == 'true'
+        shell: bash
         run: |
-          if [ -z "${{ inputs.helm_release }}" ] || [ -z "${{ inputs.helm_chart }}" ]; then
-            echo "helm_release and helm_chart are required when Helm deploy is enabled (set helm_release + helm_chart)."
-            exit 1
-          fi
-          VALUES_ARG=""
-          if [ -n "${{ inputs.helm_values_file }}" ]; then
-            VALUES_ARG="-f ${{ inputs.helm_values_file }}"
-          fi
-          SET_ARGS="--set ${{ inputs.helm_image_tag_path }}=${{ steps.version.outputs.image_tag }}"
-          if [ -n "${{ inputs.helm_set }}" ]; then
-            SET_ARGS="$SET_ARGS --set ${{ inputs.helm_set }}"
-          fi
           helm upgrade --install \
             "${{ inputs.helm_release }}" \
             "${{ inputs.helm_chart }}" \
-            $VALUES_ARG \
+            -f "${{ inputs.helm_values_file }}" \
             -n "${{ inputs.kube_namespace }}" \
+            --set-string "${{ needs.plan.outputs.helm_set_args }}" \
             --rollback-on-failure \
             --wait \
-            --timeout 3m \
-            --history-max 5 \
-            $SET_ARGS
+            --timeout "${{ inputs.helm_timeout }}" \
+            --history-max 5
