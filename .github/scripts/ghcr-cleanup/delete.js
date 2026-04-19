@@ -13,9 +13,14 @@ module.exports = async function runDelete({ github, core, process }) {
     const versions = Array.isArray(imagePlan.versions) ? imagePlan.versions : [];
 
     let deleted = 0;
+    const deletedByReason = {};
+    const plannedByReason = {};
     const failed = [];
 
     for (const version of versions) {
+      const reason = version.reason || "unknown";
+      plannedByReason[reason] = (plannedByReason[reason] || 0) + 1;
+
       const scopes = ["org", "user"];
       let success = false;
       let lastError = null;
@@ -49,7 +54,10 @@ module.exports = async function runDelete({ github, core, process }) {
 
       if (success) {
         deleted += 1;
-        core.info(`[${owner}/${packageName}] Deleted version ${version.id} (${(version.tags || []).join(", ")})`);
+        deletedByReason[reason] = (deletedByReason[reason] || 0) + 1;
+        const tagsText = version.tags?.length > 0 ? version.tags.join(", ") : "untagged";
+        const reasonText = version.reason ? ` reason=${reason}` : "";
+        core.info(`[${owner}/${packageName}] Deleted version ${version.id} (${tagsText})${reasonText}`);
       } else {
         const message =
           "Delete failed in both owner scopes (org/user). " +
@@ -63,12 +71,14 @@ module.exports = async function runDelete({ github, core, process }) {
       image: `${owner}/${packageName}`,
       planned: versions.length,
       deleted,
+      plannedByReason,
+      deletedByReason,
       failed: failed.length,
     });
   }
 
   await core.summary
-    .addHeading(`GHCR PR image cleanup delete (${mode})`)
+    .addHeading(`GHCR image cleanup delete (${mode})`)
     .addRaw(`Planned at: \`${plan.generatedAt || "unknown"}\`\n`)
     .addRaw(`Cutoff (UTC): \`${plan.cutoffIso || "unknown"}\`\n\n`);
 
@@ -77,6 +87,10 @@ module.exports = async function runDelete({ github, core, process }) {
       .addRaw(`### ${result.image}\n`)
       .addRaw(`Planned: \`${result.planned}\`\n`)
       .addRaw(`Deleted: \`${result.deleted}\`\n`)
+      .addRaw(`Planned PR/cache-tagged versions: \`${result.plannedByReason["pr-tagged"] || 0}\`\n`)
+      .addRaw(`Deleted PR/cache-tagged versions: \`${result.deletedByReason["pr-tagged"] || 0}\`\n`)
+      .addRaw(`Planned untagged versions: \`${result.plannedByReason.untagged || 0}\`\n`)
+      .addRaw(`Deleted untagged versions: \`${result.deletedByReason.untagged || 0}\`\n`)
       .addRaw(`Failed: \`${result.failed}\`\n\n`);
   }
 

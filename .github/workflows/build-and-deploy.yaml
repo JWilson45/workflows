@@ -41,6 +41,10 @@ on:
     secrets:
       kubeconfig_b64:
         required: true
+      dockerhub_username:
+        required: false
+      dockerhub_token:
+        required: false
 
 jobs:
   plan:
@@ -51,6 +55,7 @@ jobs:
       cancel-in-progress: true
     permissions:
       contents: read
+      pull-requests: read
     outputs:
       build_matrix: ${{ steps.plan.outputs.build_matrix }}
       helm_set_args: ${{ steps.plan.outputs.helm_set_args }}
@@ -72,6 +77,20 @@ jobs:
           jq -e 'type == "array" and length > 0' "$images_file" >/dev/null
 
           pr_number="${{ github.event.pull_request.number }}"
+          cache_pr_number="$pr_number"
+          is_open_pr_context=false
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ github.event.action }}" != "closed" ]; then
+            is_open_pr_context=true
+          fi
+          if [ -z "$cache_pr_number" ] && [ "${{ github.event_name }}" = "push" ]; then
+            associated_prs_json="$(curl -fsSL \
+              -H "Authorization: Bearer ${{ github.token }}" \
+              -H "Accept: application/vnd.github.groot-preview+json" \
+              "https://api.github.com/repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" || true)"
+            if [ -n "$associated_prs_json" ]; then
+              cache_pr_number="$(jq -r 'if type == "array" then [.[] | select(.merged_at != null)] | sort_by(.number) | last | .number // empty else empty end' <<< "$associated_prs_json")"
+            fi
+          fi
           short_sha="$(echo "$GITHUB_SHA" | cut -c1-7)"
           build_matrix='[]'
           helm_set_args=''
@@ -89,9 +108,19 @@ jobs:
             token="$(curl -s "https://$registry/token?scope=repository:$repo:pull" | jq -r .token)"
             status="$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Authorization: Bearer $token" \
-              -H "Accept: application/vnd.oci.image.index.v1+json" \
+              -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
               "https://$registry/v2/$repo/manifests/$tag")"
             [ "$status" = "200" ]
+          }
+
+          append_cache_from() {
+            local current="$1"
+            local ref="$2"
+            if [ -z "$current" ]; then
+              printf 'type=registry,ref=%s' "$ref"
+            else
+              printf '%s\n%s' "$current" "type=registry,ref=$ref"
+            fi
           }
 
           while IFS= read -r image_config; do
@@ -99,6 +128,8 @@ jobs:
             image="$(jq -r '.image // empty' <<< "$image_config")"
             app_dir="$(jq -r '.appDir // empty' <<< "$image_config")"
             docker_target="$(jq -r '.dockerTarget // empty' <<< "$image_config")"
+            docker_context="$(jq -r '.context // "."' <<< "$image_config")"
+            dockerfile="$(jq -r '.dockerfile // "Dockerfile"' <<< "$image_config")"
             helm_tag_path="$(jq -r '.helmTagPath // empty' <<< "$image_config")"
 
             if [ -z "$name" ] || [ -z "$image" ] || [ -z "$app_dir" ] || [ -z "$docker_target" ] || [ -z "$helm_tag_path" ]; then
@@ -114,7 +145,7 @@ jobs:
               "https://api.github.com/repos/${{ github.repository }}/contents/$app_dir/package.json?ref=${{ github.sha }}")"
             version="$(jq -r '.version' <<< "$package_json")"
 
-            if [ -n "$pr_number" ]; then
+            if [ "$is_open_pr_context" = "true" ]; then
               image_tag="${version}-pr${pr_number}-${short_sha}"
             else
               image_tag="$version"
@@ -124,6 +155,22 @@ jobs:
             if [ -z "$pr_number" ]; then
               tags="${tags}"$'\n'"$image:latest"
             fi
+            cache_tag="$(printf '%s' "$docker_target" | tr -c 'A-Za-z0-9_.-' '-')"
+            cache_ref="$image:buildcache-$cache_tag"
+            cache_from=""
+            cache_to="type=registry,ref=$cache_ref,mode=max"
+            if [ -n "$cache_pr_number" ]; then
+              pr_cache_ref="$image:buildcache-$cache_tag-pr$cache_pr_number"
+              if check_tag "$image" "buildcache-$cache_tag-pr$cache_pr_number"; then
+                cache_from="$(append_cache_from "$cache_from" "$pr_cache_ref")"
+              fi
+              if [ "$is_open_pr_context" = "true" ]; then
+                cache_to="type=registry,ref=$pr_cache_ref,mode=max"
+              fi
+            fi
+            if check_tag "$image" "buildcache-$cache_tag"; then
+              cache_from="$(append_cache_from "$cache_from" "$cache_ref")"
+            fi
 
             if ! check_tag "$image" "$image_tag"; then
               matrix_item="$(jq -cn \
@@ -131,9 +178,12 @@ jobs:
                 --arg image "$image" \
                 --arg registry "$registry" \
                 --arg dockerTarget "$docker_target" \
+                --arg dockerContext "$docker_context" \
+                --arg dockerfile "$dockerfile" \
                 --arg tags "$tags" \
-                --arg cacheScope "${image}-${docker_target}" \
-                '{name:$name,image:$image,registry:$registry,dockerTarget:$dockerTarget,tags:$tags,cacheScope:$cacheScope}')"
+                --arg cacheFrom "$cache_from" \
+                --arg cacheTo "$cache_to" \
+                '{name:$name,image:$image,registry:$registry,dockerTarget:$dockerTarget,dockerContext:$dockerContext,dockerfile:$dockerfile,tags:$tags,cacheFrom:$cacheFrom,cacheTo:$cacheTo}')"
               build_matrix="$(jq -c --argjson item "$matrix_item" '. + [$item]' <<< "$build_matrix")"
             fi
 
@@ -195,19 +245,39 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
+      - name: Check Docker Hub credentials
+        id: dockerhub
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.dockerhub_username }}
+          DOCKERHUB_TOKEN: ${{ secrets.dockerhub_token }}
+        run: |
+          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to Docker Hub
+        if: steps.dockerhub.outputs.enabled == 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.dockerhub_username }}
+          password: ${{ secrets.dockerhub_token }}
+
       - name: Build image
         uses: docker/build-push-action@v7
         with:
-          context: .
-          file: Dockerfile
+          context: ${{ matrix.image.dockerContext }}
+          file: ${{ matrix.image.dockerfile }}
           target: ${{ matrix.image.dockerTarget }}
           platforms: ${{ inputs.platforms }}
           push: true
           provenance: mode=max
           sbom: true
           tags: ${{ matrix.image.tags }}
-          cache-from: type=gha,scope=${{ matrix.image.cacheScope }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image.cacheScope }}
+          cache-from: ${{ matrix.image.cacheFrom }}
+          cache-to: ${{ matrix.image.cacheTo }}
 
   deploy:
     needs:

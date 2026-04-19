@@ -49,11 +49,14 @@ module.exports = async function runPlan({ github, context, core, process }) {
   }
 
   const uniqueImageNames = [...new Set(imageNames)];
-  const prTagPattern = /-pr(\d+)-[0-9a-f]{7,}$/i;
+  const prImageTagPattern = /-pr(\d+)-[0-9a-f]{7,}$/i;
+  const prCacheTagPattern = /^buildcache-.+-pr(\d+)$/i;
   const extractPrFromTag = (tag) => {
-    const match = String(tag || "").match(prTagPattern);
+    const value = String(tag || "");
+    const match = value.match(prImageTagPattern) || value.match(prCacheTagPattern);
     return match ? match[1] : null;
   };
+  const isPrCleanupTag = (tag) => Boolean(extractPrFromTag(tag));
 
   const results = [];
   const deletePlan = {
@@ -125,24 +128,24 @@ module.exports = async function runPlan({ github, context, core, process }) {
 
       for (const version of versions) {
         const tags = version?.metadata?.container?.tags || [];
-        if (!Array.isArray(tags) || tags.length === 0) {
+        const hasTags = Array.isArray(tags) && tags.length > 0;
+        const isUntagged = !hasTags;
+
+        const extractedPrs = hasTags ? tags.map((tag) => extractPrFromTag(tag)) : [];
+        const hasPrCleanupTag = extractedPrs.some(Boolean);
+        const allTagsArePrCleanupTags = hasTags && tags.every((tag) => isPrCleanupTag(tag));
+        if (!isUntagged && !hasPrCleanupTag) {
           continue;
         }
 
-        const extractedPrs = tags.map((tag) => extractPrFromTag(tag));
-        const hasPrTag = extractedPrs.some(Boolean);
-        const allPrTags = extractedPrs.every(Boolean);
-        if (!hasPrTag) {
-          continue;
-        }
-
-        if (!allPrTags) {
+        if (hasPrCleanupTag && !allTagsArePrCleanupTags) {
           protectedMixedTags.push({ id: version.id, tags });
           continue;
         }
 
-        const versionPrs = [...new Set(extractedPrs)];
-        const matchesSelection = selectedPrs.size === 0 ? true : versionPrs.every((pr) => selectedPrs.has(pr));
+        const versionPrs = [...new Set(extractedPrs.filter(Boolean))];
+        const matchesSelection =
+          isUntagged || selectedPrs.size === 0 ? true : versionPrs.every((pr) => selectedPrs.has(pr));
 
         if (!matchesSelection) {
           if (selectedPrs.size > 0 && versionPrs.some((pr) => selectedPrs.has(pr))) {
@@ -168,13 +171,20 @@ module.exports = async function runPlan({ github, context, core, process }) {
           continue;
         }
 
-        candidates.push({ id: version.id, tags, prs: versionPrs, updatedAt: timestamp });
+        candidates.push({
+          id: version.id,
+          tags,
+          prs: versionPrs,
+          updatedAt: timestamp,
+          reason: isUntagged ? "untagged" : "pr-tagged",
+        });
       }
 
       for (const candidate of candidates) {
         core.info(
-          `[dry-run] [${owner}/${packageName}] Would delete version ${candidate.id} (${candidate.tags.join(", ")}) ` +
-            `updated_at=${candidate.updatedAt}`
+          `[dry-run] [${owner}/${packageName}] Would delete version ${candidate.id} ` +
+            `(${candidate.tags.length > 0 ? candidate.tags.join(", ") : "untagged"}) ` +
+            `reason=${candidate.reason} updated_at=${candidate.updatedAt}`
         );
       }
 
@@ -185,14 +195,19 @@ module.exports = async function runPlan({ github, context, core, process }) {
         versions: candidates.map((candidate) => ({
           id: candidate.id,
           tags: candidate.tags,
+          reason: candidate.reason,
           updatedAt: candidate.updatedAt,
         })),
       });
 
+      const untaggedCandidates = candidates.filter((candidate) => candidate.reason === "untagged").length;
+      const prTaggedCandidates = candidates.filter((candidate) => candidate.reason === "pr-tagged").length;
       results.push({
         image: `${owner}/${packageName}`,
         versionsScanned: versions.length,
         candidates: candidates.length,
+        prTaggedCandidates,
+        untaggedCandidates,
         protectedMixed: protectedMixedTags.length,
         skippedBySelection: skippedBySelection.length,
         skippedByAge: skippedByAge.length,
@@ -204,6 +219,8 @@ module.exports = async function runPlan({ github, context, core, process }) {
         image: imageName,
         versionsScanned: 0,
         candidates: 0,
+        prTaggedCandidates: 0,
+        untaggedCandidates: 0,
         protectedMixed: 0,
         skippedBySelection: 0,
         skippedByAge: 0,
@@ -222,7 +239,7 @@ module.exports = async function runPlan({ github, context, core, process }) {
   core.setOutput("candidate_count", String(candidateCount));
 
   await core.summary
-    .addHeading("GHCR PR image cleanup plan (stage 1)")
+    .addHeading("GHCR image cleanup plan (stage 1)")
     .addRaw(`Images: \`${uniqueImageNames.join(", ")}\`\n`)
     .addRaw("Mode: `dry-run`\n")
     .addRaw(`Selection: \`${selectedText}\`\n`)
@@ -235,6 +252,8 @@ module.exports = async function runPlan({ github, context, core, process }) {
       .addRaw(`### ${result.image}\n`)
       .addRaw(`Versions scanned: \`${result.versionsScanned}\`\n`)
       .addRaw(`Candidates: \`${result.candidates}\`\n`)
+      .addRaw(`Candidate PR/cache-tagged versions: \`${result.prTaggedCandidates}\`\n`)
+      .addRaw(`Candidate untagged versions: \`${result.untaggedCandidates}\`\n`)
       .addRaw(`Protected (mixed PR/non-PR tags): \`${result.protectedMixed}\`\n`)
       .addRaw(`Skipped (partial selection overlap): \`${result.skippedBySelection}\`\n`)
       .addRaw(`Skipped (newer than cutoff): \`${result.skippedByAge}\`\n`)

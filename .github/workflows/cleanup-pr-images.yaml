@@ -1,4 +1,4 @@
-name: Cleanup GHCR PR Images
+name: Cleanup GHCR Images
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ on:
         default: ""
         type: string
       pr_numbers:
-        description: "PRs (e.g. 123,456). Blank = all"
+        description: "PRs (e.g. 123,456). Blank = all PR-tagged versions"
         required: false
         default: ""
         type: string
