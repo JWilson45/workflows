@@ -77,10 +77,18 @@ jobs:
           jq -e 'type == "array" and length > 0' "$images_file" >/dev/null
 
           pr_number="${{ github.event.pull_request.number }}"
+          source_ref="${{ github.sha }}"
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ github.event.action }}" = "closed" ] && [ -n "${{ github.event.pull_request.merge_commit_sha }}" ]; then
+            source_ref="${{ github.event.pull_request.merge_commit_sha }}"
+          fi
           cache_pr_number="$pr_number"
           is_open_pr_context=false
           if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ github.event.action }}" != "closed" ]; then
             is_open_pr_context=true
+          fi
+          is_merged_pr_close=false
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ github.event.action }}" = "closed" ] && [ "${{ github.event.pull_request.merged }}" = "true" ]; then
+            is_merged_pr_close=true
           fi
           if [ -z "$cache_pr_number" ] && [ "${{ github.event_name }}" = "push" ]; then
             associated_prs_json="$(curl -fsSL \
@@ -142,7 +150,7 @@ jobs:
             package_json="$(curl -fsSL \
               -H "Authorization: Bearer ${{ github.token }}" \
               -H "Accept: application/vnd.github.raw" \
-              "https://api.github.com/repos/${{ github.repository }}/contents/$app_dir/package.json?ref=${{ github.sha }}")"
+              "https://api.github.com/repos/${{ github.repository }}/contents/$app_dir/package.json?ref=$source_ref")"
             version="$(jq -r '.version' <<< "$package_json")"
 
             if [ "$is_open_pr_context" = "true" ]; then
@@ -152,7 +160,7 @@ jobs:
             fi
 
             tags="$image:$image_tag"
-            if [ -z "$pr_number" ]; then
+            if [ "$is_open_pr_context" != "true" ]; then
               tags="${tags}"$'\n'"$image:latest"
             fi
             cache_tag="$(printf '%s' "$docker_target" | tr -c 'A-Za-z0-9_.-' '-')"
@@ -204,7 +212,7 @@ jobs:
           fi
 
           should_deploy=false
-          if [ "${{ inputs.do_deploy }}" = "true" ] && { [ "$should_build" = "true" ] || [ "$operator_override" = "true" ]; }; then
+          if [ "${{ inputs.do_deploy }}" = "true" ] && { [ "$should_build" = "true" ] || [ "$operator_override" = "true" ] || [ "$is_merged_pr_close" = "true" ]; }; then
             should_deploy=true
           fi
 
@@ -232,6 +240,7 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v6
         with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merge_commit_sha || github.sha }}
           fetch-depth: 1
           persist-credentials: false
 
