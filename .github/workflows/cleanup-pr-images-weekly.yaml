@@ -1,4 +1,4 @@
-name: Cleanup GHCR PR Images Weekly
+name: Cleanup GHCR Images Weekly
 
 on:
   schedule:

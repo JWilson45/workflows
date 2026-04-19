@@ -22,7 +22,7 @@ To create a release:
 
 - `.github/workflows/build-and-deploy.yaml` – Builds and pushes a container image to GitHub Container Registry (GHCR), can deploy the image to Kubernetes clusters, and creates a GitHub Release for the calling project. For pull request builds, the image tag is suffixed as `${version}-pr${number}-${sha}` and the `latest` tag is not updated.
 
-- `.github/workflows/cleanup-pr-images.yaml` – Manually triggered workflow that removes PR-tagged GHCR container versions. It supports deleting all PR images for a package or only specific PR numbers, with a `dry-run` preview mode.
+- `.github/workflows/cleanup-pr-images.yaml` – Manually triggered workflow that removes PR-tagged GHCR container versions, PR-specific build caches, and untagged GHCR versions. It supports deleting all PR artifacts for a package or only specific PR numbers, with a `dry-run` preview mode.
 
 - `.github/workflows/cleanup-pr-images-weekly.yaml` – Weekly scheduler that dispatches the cleanup workflow with fixed inputs for micromarketing images and no approval gate.
 
@@ -54,17 +54,21 @@ jobs:
       kubeconfig_b64: ${{ secrets.KUBECONFIG_B64 }}
 ```
 
-## GHCR PR image cleanup
+## GHCR image cleanup
 
-Use *Actions -> Cleanup GHCR PR Images* to clean up PR images that were created by the build workflow.
+Use *Actions -> Cleanup GHCR Images* to clean up PR images, PR-specific registry build caches, and tagless GHCR versions that were created by the build workflow.
 
 - `image_name` (optional): one or more images, comma-separated (for example `ghcr.io/org/repo-a,ghcr.io/org/repo-b`)
 - default image when blank: `ghcr.io/JWilson45/<repo>`
-- `pr_numbers` (optional): comma-separated PR numbers, for example `123,456`; leave blank to target all PR images
-- `older_than_days` (default `7`): only delete PR image versions older than this many days
+- `pr_numbers` (optional): comma-separated PR numbers, for example `123,456`; leave blank to target all PR-tagged versions
+- `older_than_days` (default `7`): only delete candidate versions older than this many days
 - `require_approval` (default `true`): when true, stage 2 uses environment `delete`
 - note: IDs like `652340938` in logs are GHCR package version IDs (not PR numbers)
 - permissions: delete requires package admin access for the token on the target package
+- deletes versions whose tags are all PR image tags like `1.2.3-pr123-abcdef0`
+- deletes versions whose tags are all PR cache tags like `buildcache-api-pr123`
+- deletes untagged versions older than the cutoff
+- protects versions with any non-PR tag, including `latest`, release/version tags, and shared baseline cache tags like `buildcache-api`
 - stage 1 builds a dry-run delete plan and uploads `delete-plan` artifact
 - manual stage 2 runs in environment `delete` (approval gate)
 - implementation files:
@@ -76,6 +80,6 @@ Use *Actions -> Cleanup GHCR PR Images* to clean up PR images that were created 
 `cleanup-pr-images-weekly.yaml` runs every Sunday at 16:20 UTC and dispatches `cleanup-pr-images.yaml` with:
 
 - `image_name`: `ghcr.io/JWilson45/mmmodern-web,ghcr.io/JWilson45/mmmodern-api,ghcr.io/JWilson45/mm`
-- `pr_numbers`: blank (all PR images)
+- `pr_numbers`: blank (all PR-tagged versions)
 - `older_than_days`: `7`
 - `require_approval`: `false`

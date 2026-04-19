@@ -124,6 +124,15 @@ jobs:
             if [ -z "$pr_number" ]; then
               tags="${tags}"$'\n'"$image:latest"
             fi
+            cache_tag="$(printf '%s' "$docker_target" | tr -c 'A-Za-z0-9_.-' '-')"
+            cache_ref="$image:buildcache-$cache_tag"
+            cache_from="type=registry,ref=$cache_ref"
+            cache_to="type=registry,ref=$cache_ref,mode=max"
+            if [ -n "$pr_number" ]; then
+              pr_cache_ref="$image:buildcache-$cache_tag-pr$pr_number"
+              cache_from="type=registry,ref=$pr_cache_ref"$'\n'"type=registry,ref=$cache_ref"
+              cache_to="type=registry,ref=$pr_cache_ref,mode=max"
+            fi
 
             if ! check_tag "$image" "$image_tag"; then
               matrix_item="$(jq -cn \
@@ -132,8 +141,9 @@ jobs:
                 --arg registry "$registry" \
                 --arg dockerTarget "$docker_target" \
                 --arg tags "$tags" \
-                --arg cacheScope "${image}-${docker_target}" \
-                '{name:$name,image:$image,registry:$registry,dockerTarget:$dockerTarget,tags:$tags,cacheScope:$cacheScope}')"
+                --arg cacheFrom "$cache_from" \
+                --arg cacheTo "$cache_to" \
+                '{name:$name,image:$image,registry:$registry,dockerTarget:$dockerTarget,tags:$tags,cacheFrom:$cacheFrom,cacheTo:$cacheTo}')"
               build_matrix="$(jq -c --argjson item "$matrix_item" '. + [$item]' <<< "$build_matrix")"
             fi
 
@@ -206,8 +216,8 @@ jobs:
           provenance: mode=max
           sbom: true
           tags: ${{ matrix.image.tags }}
-          cache-from: type=gha,scope=${{ matrix.image.cacheScope }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image.cacheScope }}
+          cache-from: ${{ matrix.image.cacheFrom }}
+          cache-to: ${{ matrix.image.cacheTo }}
 
   deploy:
     needs:
