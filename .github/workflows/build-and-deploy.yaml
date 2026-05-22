@@ -455,6 +455,10 @@ jobs:
           echo "Failed to push GitOps update after retrying." >&2
           exit 1
 
+      - name: Set up kubectl
+        if: inputs.gitops_repository != '' && steps.push_gitops_update.outputs.changed == 'true'
+        uses: azure/setup-kubectl@v4
+
       - name: Refresh Argo CD parent application
         if: inputs.gitops_repository != '' && steps.push_gitops_update.outputs.changed == 'true'
         shell: bash
