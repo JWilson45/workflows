@@ -50,18 +50,6 @@ on:
         required: false
         default: main
         type: string
-      gitops_refresh_namespace:
-        required: false
-        default: argocd
-        type: string
-      gitops_refresh_application:
-        required: false
-        default: applications
-        type: string
-      gitops_refresh_kube_server:
-        required: false
-        default: ""
-        type: string
       gitops_webhook_url:
         required: false
         default: ""
