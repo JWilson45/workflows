@@ -50,9 +50,21 @@ on:
         required: false
         default: main
         type: string
+      gitops_refresh_namespace:
+        required: false
+        default: argocd
+        type: string
+      gitops_refresh_application:
+        required: false
+        default: applications
+        type: string
+      gitops_refresh_kube_server:
+        required: false
+        default: ""
+        type: string
     secrets:
       kubeconfig_b64:
-        required: true
+        required: false
       dockerhub_username:
         required: false
       dockerhub_token:
@@ -415,6 +427,7 @@ jobs:
           PY
 
       - name: Push GitOps update
+        id: push_gitops_update
         if: inputs.gitops_repository != ''
         working-directory: gitops
         shell: bash
@@ -422,6 +435,7 @@ jobs:
           set -euo pipefail
           if git diff --quiet; then
             echo "No GitOps changes to commit."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git config user.name "github-actions[bot]"
@@ -430,3 +444,20 @@ jobs:
           git commit -m "Update ${{ inputs.helm_release }} image tag"
           git pull --rebase origin "${{ inputs.gitops_branch }}"
           git push origin HEAD:${{ inputs.gitops_branch }}
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Refresh Argo CD parent application
+        if: inputs.gitops_repository != '' && steps.push_gitops_update.outputs.changed == 'true'
+        shell: bash
+        env:
+          KUBE_SERVER: ${{ inputs.gitops_refresh_kube_server }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KUBE_SERVER" ]; then
+            echo "gitops_refresh_kube_server is required for GitOps Tailscale refresh." >&2
+            exit 1
+          fi
+          export KUBECONFIG="$RUNNER_TEMP/gitops-refresh-kubeconfig"
+          kubectl --server "$KUBE_SERVER" -n "${{ inputs.gitops_refresh_namespace }}" annotate application "${{ inputs.gitops_refresh_application }}" \
+            argocd.argoproj.io/refresh=hard \
+            --overwrite

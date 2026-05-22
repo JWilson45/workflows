@@ -32,6 +32,14 @@ To create a release:
 
 The build-and-deploy workflow can deploy with Helm instead of `kubectl`. Helm is enabled when `use_helm: "true"` or when `helm_values_file` is set. The image tag is set via `helm_image_tag_path` (defaults to `image.tag`).
 
+When `gitops_repository` is set, the workflow updates the GitOps repository
+instead of running Helm against the cluster. If `gitops_refresh_kube_server` is
+provided, it configures `kubectl` through the Tailscale Kubernetes API server
+proxy and annotates the parent Argo CD Application. This avoids storing
+kubeconfigs or ServiceAccount tokens in GitHub Secrets; the runner must be on a
+node whose Tailscale identity is authorized by Kubernetes RBAC through the
+Tailscale proxy impersonation identity.
+
 Example usage:
 
 ```yaml
