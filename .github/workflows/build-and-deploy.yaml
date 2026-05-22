@@ -62,6 +62,10 @@ on:
         required: false
         default: ""
         type: string
+      gitops_webhook_url:
+        required: false
+        default: ""
+        type: string
     secrets:
       kubeconfig_b64:
         required: false
@@ -70,6 +74,8 @@ on:
       dockerhub_token:
         required: false
       gitops_token:
+        required: false
+      gitops_webhook_secret:
         required: false
 
 jobs:
@@ -455,22 +461,55 @@ jobs:
           echo "Failed to push GitOps update after retrying." >&2
           exit 1
 
-      - name: Set up kubectl
+      - name: Trigger Argo CD webhook
         if: inputs.gitops_repository != '' && steps.push_gitops_update.outputs.changed == 'true'
-        uses: azure/setup-kubectl@v4
-
-      - name: Refresh Argo CD parent application
-        if: inputs.gitops_repository != '' && steps.push_gitops_update.outputs.changed == 'true'
+        working-directory: gitops
         shell: bash
         env:
-          KUBE_SERVER: ${{ inputs.gitops_refresh_kube_server }}
+          GITOPS_WEBHOOK_URL: ${{ inputs.gitops_webhook_url }}
+          GITOPS_WEBHOOK_SECRET: ${{ secrets.gitops_webhook_secret }}
+          GITOPS_BRANCH: ${{ inputs.gitops_branch }}
         run: |
           set -euo pipefail
-          if [ -z "$KUBE_SERVER" ]; then
-            echo "gitops_refresh_kube_server is required for GitOps Tailscale refresh." >&2
-            exit 1
+          if [ -z "$GITOPS_WEBHOOK_URL" ]; then
+            echo "gitops_webhook_url is not set; skipping Argo CD webhook trigger."
+            exit 0
           fi
-          export KUBECONFIG="$RUNNER_TEMP/gitops-refresh-kubeconfig"
-          kubectl --server "$KUBE_SERVER" -n "${{ inputs.gitops_refresh_namespace }}" annotate application "${{ inputs.gitops_refresh_application }}" \
-            argocd.argoproj.io/refresh=hard \
-            --overwrite
+
+          webhook_url="${GITOPS_WEBHOOK_URL%/}/api/webhook"
+          payload_file="$(mktemp)"
+          signature_file="$(mktemp)"
+          commit_sha="$(git rev-parse HEAD)"
+          repo_url="https://github.com/${{ inputs.gitops_repository }}.git"
+
+          jq -cn \
+            --arg ref "refs/heads/$GITOPS_BRANCH" \
+            --arg before "" \
+            --arg after "$commit_sha" \
+            --arg clone_url "$repo_url" \
+            --arg html_url "https://github.com/${{ inputs.gitops_repository }}" \
+            '{ref:$ref,before:$before,after:$after,repository:{clone_url:$clone_url,html_url:$html_url,url:$html_url}}' \
+            > "$payload_file"
+
+          headers=(
+            -H "Content-Type: application/json"
+            -H "X-GitHub-Event: push"
+            -H "X-GitHub-Delivery: $GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          )
+
+          if [ -n "$GITOPS_WEBHOOK_SECRET" ]; then
+            python3 - "$GITOPS_WEBHOOK_SECRET" "$payload_file" "$signature_file" <<'PY'
+          import hmac
+          import hashlib
+          import sys
+          from pathlib import Path
+
+          secret = sys.argv[1].encode()
+          payload = Path(sys.argv[2]).read_bytes()
+          signature = hmac.new(secret, payload, hashlib.sha256).hexdigest()
+          Path(sys.argv[3]).write_text(f"sha256={signature}")
+          PY
+            headers+=(-H "X-Hub-Signature-256: $(cat "$signature_file")")
+          fi
+
+          curl -fsSL -X POST "${headers[@]}" --data-binary "@$payload_file" "$webhook_url"
