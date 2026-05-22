@@ -395,7 +395,10 @@ jobs:
           seen = set()
           for i, line in enumerate(lines):
               stripped = line.strip()
-              if stripped.startswith("name: "):
+              if stripped.startswith("- name: "):
+                  name = stripped.removeprefix("- name: ").strip().strip('"').strip("'")
+                  current = name if name in updates else None
+              elif stripped.startswith("name: "):
                   name = stripped.removeprefix("name: ").strip().strip('"').strip("'")
                   current = name if name in updates else None
               elif current and stripped.startswith("value:"):
