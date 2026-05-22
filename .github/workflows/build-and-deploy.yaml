@@ -38,12 +38,26 @@ on:
         required: false
         default: true
         type: boolean
+      gitops_repository:
+        required: false
+        default: ""
+        type: string
+      gitops_application_file:
+        required: false
+        default: ""
+        type: string
+      gitops_branch:
+        required: false
+        default: main
+        type: string
     secrets:
       kubeconfig_b64:
         required: true
       dockerhub_username:
         required: false
       dockerhub_token:
+        required: false
+      gitops_token:
         required: false
 
 jobs:
@@ -302,15 +316,18 @@ jobs:
       contents: read
     steps:
       - name: Checkout repo
+        if: inputs.gitops_repository == ''
         uses: actions/checkout@v6
         with:
           fetch-depth: 1
           persist-credentials: false
 
       - name: Set up Helm
+        if: inputs.gitops_repository == ''
         uses: azure/setup-helm@v4
 
       - name: Load kubeconfig
+        if: inputs.gitops_repository == ''
         shell: bash
         run: |
           mkdir -p "$HOME/.kube"
@@ -318,6 +335,7 @@ jobs:
           chmod 600 "$HOME/.kube/config"
 
       - name: Helm upgrade/install
+        if: inputs.gitops_repository == ''
         shell: bash
         run: |
           helm upgrade --install \
@@ -330,3 +348,82 @@ jobs:
             --wait \
             --timeout "${{ inputs.helm_timeout }}" \
             --history-max 5
+
+      - name: Checkout GitOps repo
+        if: inputs.gitops_repository != ''
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.gitops_repository }}
+          ref: ${{ inputs.gitops_branch }}
+          token: ${{ secrets.gitops_token }}
+          path: gitops
+          fetch-depth: 1
+
+      - name: Update GitOps image tags
+        if: inputs.gitops_repository != ''
+        shell: bash
+        env:
+          APPLICATION_FILE: ${{ inputs.gitops_application_file }}
+          HELM_SET_ARGS: ${{ needs.plan.outputs.helm_set_args }}
+        run: |
+          set -euo pipefail
+          if [ -z "$APPLICATION_FILE" ]; then
+            echo "gitops_application_file is required when gitops_repository is set." >&2
+            exit 1
+          fi
+          if [ -z "$HELM_SET_ARGS" ]; then
+            echo "No Helm image tag parameters were planned." >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+
+          path = Path("gitops") / os.environ["APPLICATION_FILE"]
+          if not path.exists():
+              raise SystemExit(f"{path} does not exist")
+
+          updates = {}
+          for item in os.environ["HELM_SET_ARGS"].split(","):
+              if "=" not in item:
+                  raise SystemExit(f"Invalid Helm set argument: {item}")
+              name, value = item.split("=", 1)
+              updates[name] = value
+
+          lines = path.read_text().splitlines()
+          current = None
+          seen = set()
+          for i, line in enumerate(lines):
+              stripped = line.strip()
+              if stripped.startswith("name: "):
+                  name = stripped.removeprefix("name: ").strip().strip('"').strip("'")
+                  current = name if name in updates else None
+              elif current and stripped.startswith("value:"):
+                  indent = line[:len(line) - len(line.lstrip())]
+                  lines[i] = f"{indent}value: {updates[current]}"
+                  seen.add(current)
+                  current = None
+
+          missing = sorted(set(updates) - seen)
+          if missing:
+              raise SystemExit(f"Missing Helm parameter(s) in {path}: {', '.join(missing)}")
+
+          path.write_text("\n".join(lines) + "\n")
+          PY
+
+      - name: Push GitOps update
+        if: inputs.gitops_repository != ''
+        working-directory: gitops
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "No GitOps changes to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "${{ inputs.gitops_application_file }}"
+          git commit -m "Update ${{ inputs.helm_release }} image tag"
+          git pull --rebase origin "${{ inputs.gitops_branch }}"
+          git push origin HEAD:${{ inputs.gitops_branch }}
