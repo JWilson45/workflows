@@ -32,6 +32,14 @@ To create a release:
 
 The build-and-deploy workflow can deploy with Helm instead of `kubectl`. Helm is enabled when `use_helm: "true"` or when `helm_values_file` is set. The image tag is set via `helm_image_tag_path` (defaults to `image.tag`).
 
+When `gitops_repository` is set, the workflow updates the GitOps repository
+instead of running Helm against the cluster. If `gitops_webhook_url` is provided,
+it posts a GitHub-style push webhook to `${gitops_webhook_url}/api/webhook` after
+the GitOps commit is pushed. This lets private runners trigger Argo CD refreshes
+over Tailscale or another private network without storing kubeconfigs or
+ServiceAccount tokens in GitHub Secrets. If `gitops_webhook_secret` is provided,
+the request includes `X-Hub-Signature-256`.
+
 Example usage:
 
 ```yaml

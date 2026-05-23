@@ -38,12 +38,32 @@ on:
         required: false
         default: true
         type: boolean
+      gitops_repository:
+        required: false
+        default: ""
+        type: string
+      gitops_application_file:
+        required: false
+        default: ""
+        type: string
+      gitops_branch:
+        required: false
+        default: main
+        type: string
+      gitops_webhook_url:
+        required: false
+        default: ""
+        type: string
     secrets:
       kubeconfig_b64:
-        required: true
+        required: false
       dockerhub_username:
         required: false
       dockerhub_token:
+        required: false
+      gitops_token:
+        required: false
+      gitops_webhook_secret:
         required: false
 
 jobs:
@@ -302,15 +322,18 @@ jobs:
       contents: read
     steps:
       - name: Checkout repo
+        if: inputs.gitops_repository == ''
         uses: actions/checkout@v6
         with:
           fetch-depth: 1
           persist-credentials: false
 
       - name: Set up Helm
+        if: inputs.gitops_repository == ''
         uses: azure/setup-helm@v4
 
       - name: Load kubeconfig
+        if: inputs.gitops_repository == ''
         shell: bash
         run: |
           mkdir -p "$HOME/.kube"
@@ -318,6 +341,7 @@ jobs:
           chmod 600 "$HOME/.kube/config"
 
       - name: Helm upgrade/install
+        if: inputs.gitops_repository == ''
         shell: bash
         run: |
           helm upgrade --install \
@@ -330,3 +354,150 @@ jobs:
             --wait \
             --timeout "${{ inputs.helm_timeout }}" \
             --history-max 5
+
+      - name: Checkout GitOps repo
+        if: inputs.gitops_repository != ''
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.gitops_repository }}
+          ref: ${{ inputs.gitops_branch }}
+          token: ${{ secrets.gitops_token }}
+          path: gitops
+          fetch-depth: 1
+
+      - name: Update GitOps image tags
+        if: inputs.gitops_repository != ''
+        shell: bash
+        env:
+          APPLICATION_FILE: ${{ inputs.gitops_application_file }}
+          HELM_SET_ARGS: ${{ needs.plan.outputs.helm_set_args }}
+        run: |
+          set -euo pipefail
+          if [ -z "$APPLICATION_FILE" ]; then
+            echo "gitops_application_file is required when gitops_repository is set." >&2
+            exit 1
+          fi
+          if [ -z "$HELM_SET_ARGS" ]; then
+            echo "No Helm image tag parameters were planned." >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+
+          path = Path("gitops") / os.environ["APPLICATION_FILE"]
+          if not path.exists():
+              raise SystemExit(f"{path} does not exist")
+
+          updates = {}
+          for item in os.environ["HELM_SET_ARGS"].split(","):
+              if "=" not in item:
+                  raise SystemExit(f"Invalid Helm set argument: {item}")
+              name, value = item.split("=", 1)
+              updates[name] = value
+
+          lines = path.read_text().splitlines()
+          current = None
+          seen = set()
+          for i, line in enumerate(lines):
+              stripped = line.strip()
+              if stripped.startswith("- name: "):
+                  name = stripped.removeprefix("- name: ").strip().strip('"').strip("'")
+                  current = name if name in updates else None
+              elif stripped.startswith("name: "):
+                  name = stripped.removeprefix("name: ").strip().strip('"').strip("'")
+                  current = name if name in updates else None
+              elif current and stripped.startswith("value:"):
+                  indent = line[:len(line) - len(line.lstrip())]
+                  lines[i] = f"{indent}value: {updates[current]}"
+                  seen.add(current)
+                  current = None
+
+          missing = sorted(set(updates) - seen)
+          if missing:
+              raise SystemExit(f"Missing Helm parameter(s) in {path}: {', '.join(missing)}")
+
+          path.write_text("\n".join(lines) + "\n")
+          PY
+
+      - name: Push GitOps update
+        id: push_gitops_update
+        if: inputs.gitops_repository != ''
+        working-directory: gitops
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "No GitOps changes to commit."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "${{ inputs.gitops_application_file }}"
+          git commit -m "Update ${{ inputs.helm_release }} image tag"
+          for attempt in 1 2 3 4 5; do
+            git fetch origin "${{ inputs.gitops_branch }}"
+            git rebase "origin/${{ inputs.gitops_branch }}"
+            if git push origin HEAD:${{ inputs.gitops_branch }}; then
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "GitOps push attempt $attempt failed; retrying after rebase." >&2
+            sleep $((attempt * 2))
+          done
+          echo "Failed to push GitOps update after retrying." >&2
+          exit 1
+
+      - name: Trigger Argo CD webhook
+        if: inputs.gitops_repository != '' && steps.push_gitops_update.outputs.changed == 'true'
+        working-directory: gitops
+        shell: bash
+        env:
+          GITOPS_WEBHOOK_URL: ${{ inputs.gitops_webhook_url }}
+          GITOPS_WEBHOOK_SECRET: ${{ secrets.gitops_webhook_secret }}
+          GITOPS_BRANCH: ${{ inputs.gitops_branch }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GITOPS_WEBHOOK_URL" ]; then
+            echo "gitops_webhook_url is not set; skipping Argo CD webhook trigger."
+            exit 0
+          fi
+
+          webhook_url="${GITOPS_WEBHOOK_URL%/}/api/webhook"
+          payload_file="$(mktemp)"
+          signature_file="$(mktemp)"
+          commit_sha="$(git rev-parse HEAD)"
+          repo_url="https://github.com/${{ inputs.gitops_repository }}.git"
+
+          jq -cn \
+            --arg ref "refs/heads/$GITOPS_BRANCH" \
+            --arg before "" \
+            --arg after "$commit_sha" \
+            --arg clone_url "$repo_url" \
+            --arg html_url "https://github.com/${{ inputs.gitops_repository }}" \
+            '{ref:$ref,before:$before,after:$after,repository:{clone_url:$clone_url,html_url:$html_url,url:$html_url}}' \
+            > "$payload_file"
+
+          headers=(
+            -H "Content-Type: application/json"
+            -H "X-GitHub-Event: push"
+            -H "X-GitHub-Delivery: $GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          )
+
+          if [ -n "$GITOPS_WEBHOOK_SECRET" ]; then
+            python3 - "$GITOPS_WEBHOOK_SECRET" "$payload_file" "$signature_file" <<'PY'
+          import hmac
+          import hashlib
+          import sys
+          from pathlib import Path
+
+          secret = sys.argv[1].encode()
+          payload = Path(sys.argv[2]).read_bytes()
+          signature = hmac.new(secret, payload, hashlib.sha256).hexdigest()
+          Path(sys.argv[3]).write_text(f"sha256={signature}")
+          PY
+            headers+=(-H "X-Hub-Signature-256: $(cat "$signature_file")")
+          fi
+
+          curl -fsSL -X POST "${headers[@]}" --data-binary "@$payload_file" "$webhook_url"
