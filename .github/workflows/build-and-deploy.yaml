@@ -321,27 +321,48 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Plan Helm deploy mode
+        id: helm_deploy
+        shell: bash
+        env:
+          GITOPS_REPOSITORY: ${{ inputs.gitops_repository }}
+          KUBECONFIG_B64: ${{ secrets.kubeconfig_b64 }}
+        run: |
+          set -euo pipefail
+          enabled=false
+          if [ -z "$GITOPS_REPOSITORY" ] || [ -n "$KUBECONFIG_B64" ]; then
+            enabled=true
+          fi
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+
       - name: Checkout repo
-        if: inputs.gitops_repository == ''
+        if: steps.helm_deploy.outputs.enabled == 'true'
         uses: actions/checkout@v6
         with:
           fetch-depth: 1
           persist-credentials: false
 
       - name: Set up Helm
-        if: inputs.gitops_repository == ''
+        if: steps.helm_deploy.outputs.enabled == 'true'
         uses: azure/setup-helm@v4
 
       - name: Load kubeconfig
-        if: inputs.gitops_repository == ''
+        if: steps.helm_deploy.outputs.enabled == 'true'
         shell: bash
+        env:
+          KUBECONFIG_B64: ${{ secrets.kubeconfig_b64 }}
         run: |
+          set -euo pipefail
+          if [ -z "$KUBECONFIG_B64" ]; then
+            echo "kubeconfig_b64 is required when Helm deployment is enabled." >&2
+            exit 1
+          fi
           mkdir -p "$HOME/.kube"
-          echo "${{ secrets.kubeconfig_b64 }}" | base64 --decode > "$HOME/.kube/config"
+          echo "$KUBECONFIG_B64" | base64 --decode > "$HOME/.kube/config"
           chmod 600 "$HOME/.kube/config"
 
       - name: Helm upgrade/install
-        if: inputs.gitops_repository == ''
+        if: steps.helm_deploy.outputs.enabled == 'true'
         shell: bash
         run: |
           helm upgrade --install \
