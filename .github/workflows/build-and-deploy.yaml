@@ -50,6 +50,14 @@ on:
         required: false
         default: main
         type: string
+      gitops_update_target_revision:
+        required: false
+        default: false
+        type: boolean
+      gitops_target_revision:
+        required: false
+        default: ""
+        type: string
       gitops_webhook_url:
         required: false
         default: ""
@@ -386,12 +394,14 @@ jobs:
           path: gitops
           fetch-depth: 1
 
-      - name: Update GitOps image tags
+      - name: Update GitOps application
         if: inputs.gitops_repository != ''
         shell: bash
         env:
           APPLICATION_FILE: ${{ inputs.gitops_application_file }}
           HELM_SET_ARGS: ${{ needs.plan.outputs.helm_set_args }}
+          GITOPS_UPDATE_TARGET_REVISION: ${{ inputs.gitops_update_target_revision }}
+          GITOPS_TARGET_REVISION: ${{ inputs.gitops_target_revision || github.head_ref || github.ref_name }}
         run: |
           set -euo pipefail
           if [ -z "$APPLICATION_FILE" ]; then
@@ -404,6 +414,7 @@ jobs:
           fi
           python3 - <<'PY'
           from pathlib import Path
+          import json
           import os
 
           path = Path("gitops") / os.environ["APPLICATION_FILE"]
@@ -438,6 +449,20 @@ jobs:
           if missing:
               raise SystemExit(f"Missing Helm parameter(s) in {path}: {', '.join(missing)}")
 
+          update_target_revision = os.environ.get("GITOPS_UPDATE_TARGET_REVISION") == "true"
+          target_revision = os.environ.get("GITOPS_TARGET_REVISION", "").strip()
+          if update_target_revision:
+              if not target_revision:
+                  raise SystemExit("gitops_update_target_revision is true but no target revision was resolved")
+              for i, line in enumerate(lines):
+                  stripped = line.strip()
+                  if stripped.startswith("targetRevision:"):
+                      indent = line[:len(line) - len(line.lstrip())]
+                      lines[i] = f"{indent}targetRevision: {json.dumps(target_revision)}"
+                      break
+              else:
+                  raise SystemExit(f"Missing targetRevision in {path}")
+
           path.write_text("\n".join(lines) + "\n")
           PY
 
@@ -456,7 +481,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add "${{ inputs.gitops_application_file }}"
-          git commit -m "Update ${{ inputs.helm_release }} image tag"
+          git commit -m "Update ${{ inputs.helm_release }} GitOps deployment"
           for attempt in 1 2 3 4 5; do
             git fetch origin "${{ inputs.gitops_branch }}"
             git rebase "origin/${{ inputs.gitops_branch }}"
