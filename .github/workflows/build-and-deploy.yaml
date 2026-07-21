@@ -96,6 +96,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      packages: read
     outputs:
       build_matrix: ${{ steps.plan.outputs.build_matrix }}
       helm_set_args: ${{ steps.plan.outputs.helm_set_args }}
@@ -106,6 +107,8 @@ jobs:
     env:
       IMAGES_JSON: ${{ inputs.images_json }}
       PRODUCTS_JSON: ${{ inputs.products_json }}
+      GH_ACTOR: ${{ github.actor }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Plan image builds
         id: plan
@@ -143,7 +146,7 @@ jobs:
           fi
           if [ -z "$cache_pr_number" ] && [ "${{ github.event_name }}" = "push" ]; then
             associated_prs_json="$(curl -fsSL \
-              -H "Authorization: Bearer ${{ github.token }}" \
+              -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github.groot-preview+json" \
               "https://api.github.com/repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" || true)"
             if [ -n "$associated_prs_json" ]; then
@@ -155,6 +158,44 @@ jobs:
           image_meta='{}'
           helm_set_args=''
 
+          # Reuse one pull token per registry repo across check_tag calls (avoids
+          # anonymous GHCR token minting + rate limits on multi-image plans).
+          REGISTRY_TOKEN_CACHE_DIR="$(mktemp -d)"
+
+          get_registry_pull_token() {
+            local image="$1"
+            local registry repo cache_key cache_file token_url token
+            registry="$(echo "$image" | cut -d'/' -f1)"
+            repo="$(echo "$image" | cut -d'/' -f2-)"
+            if [ -z "$registry" ] || [ -z "$repo" ] || [ "$registry" = "$image" ]; then
+              echo "image must be a full image reference like ghcr.io/org/repo. Got: $image" >&2
+              return 1
+            fi
+            cache_key="$(printf '%s' "${registry}/${repo}" | tr '/:' '__')"
+            cache_file="${REGISTRY_TOKEN_CACHE_DIR}/${cache_key}"
+            if [ -s "$cache_file" ]; then
+              cat "$cache_file"
+              return 0
+            fi
+
+            if [ "$registry" = "ghcr.io" ]; then
+              # Authenticated GHCR pull token via GITHUB_TOKEN (higher rate limits).
+              token_url="https://${registry}/token?service=${registry}&scope=repository:${repo}:pull"
+              token="$(curl -fsSL -u "${GH_ACTOR}:${GH_TOKEN}" "$token_url" | jq -r '.token // empty')"
+            else
+              # Best-effort anonymous token for non-GHCR registries.
+              token_url="https://${registry}/token?scope=repository:${repo}:pull"
+              token="$(curl -fsSL "$token_url" | jq -r '.token // empty' || true)"
+            fi
+
+            if [ -z "$token" ] || [ "$token" = "null" ]; then
+              echo "Failed to obtain registry pull token for ${registry}/${repo}" >&2
+              return 1
+            fi
+            printf '%s' "$token" > "$cache_file"
+            printf '%s' "$token"
+          }
+
           check_tag() {
             local image="$1"
             local tag="$2"
@@ -165,7 +206,7 @@ jobs:
               echo "image must be a full image reference like ghcr.io/org/repo. Got: $image" >&2
               exit 1
             fi
-            token="$(curl -s "https://$registry/token?scope=repository:$repo:pull" | jq -r .token)"
+            token="$(get_registry_pull_token "$image")" || return 1
             status="$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Authorization: Bearer $token" \
               -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
@@ -204,7 +245,7 @@ jobs:
 
             registry="$(echo "$image" | cut -d'/' -f1)"
             package_json="$(curl -fsSL \
-              -H "Authorization: Bearer ${{ github.token }}" \
+              -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github.raw" \
               "https://api.github.com/repos/${{ github.repository }}/contents/$app_dir/package.json?ref=$source_ref")"
             version="$(jq -r '.version' <<< "$package_json")"
