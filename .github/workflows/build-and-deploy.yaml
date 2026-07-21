@@ -4,14 +4,23 @@ on:
   workflow_call:
     inputs:
       images_json:
+        description: JSON array of images to plan/build (name, image, appDir, dockerTarget, helmTagPath, optional context/dockerfile)
         required: true
+        type: string
+      # Multi-product atomic deploy. When non-empty, kube_namespace/helm_* / gitops_application_file
+      # single-product fields are ignored in favor of per-product entries.
+      products_json:
+        description: JSON array of products to deploy atomically (optional). See README.
+        required: false
+        default: ""
         type: string
       platforms:
         required: false
         default: linux/amd64
         type: string
       kube_namespace:
-        required: true
+        required: false
+        default: ""
         type: string
       planning_runner_label:
         required: false
@@ -22,13 +31,16 @@ on:
         default: mm-runner-set
         type: string
       helm_release:
-        required: true
+        required: false
+        default: ""
         type: string
       helm_chart:
-        required: true
+        required: false
+        default: ""
         type: string
       helm_values_file:
-        required: true
+        required: false
+        default: ""
         type: string
       helm_timeout:
         required: false
@@ -79,7 +91,7 @@ jobs:
     runs-on: ${{ inputs.planning_runner_label }}
     timeout-minutes: 10
     concurrency:
-      group: ${{ github.workflow }}-${{ inputs.helm_release }}-${{ github.ref }}
+      group: ${{ github.workflow }}-${{ inputs.helm_release != '' && inputs.helm_release || 'multi' }}-${{ github.ref }}
       cancel-in-progress: true
     permissions:
       contents: read
@@ -87,10 +99,13 @@ jobs:
     outputs:
       build_matrix: ${{ steps.plan.outputs.build_matrix }}
       helm_set_args: ${{ steps.plan.outputs.helm_set_args }}
+      products_plan: ${{ steps.plan.outputs.products_plan }}
+      multi_product: ${{ steps.plan.outputs.multi_product }}
       should_build: ${{ steps.plan.outputs.should_build }}
       should_deploy: ${{ steps.plan.outputs.should_deploy }}
     env:
       IMAGES_JSON: ${{ inputs.images_json }}
+      PRODUCTS_JSON: ${{ inputs.products_json }}
       IS_MANUAL: ${{ github.event_name == 'workflow_dispatch' }}
       IS_RERUN: ${{ github.run_attempt > 1 }}
     steps:
@@ -103,6 +118,20 @@ jobs:
           images_file="$(mktemp)"
           printf '%s' "$IMAGES_JSON" > "$images_file"
           jq -e 'type == "array" and length > 0' "$images_file" >/dev/null
+
+          multi_product=false
+          products_file="$(mktemp)"
+          if [ -n "${PRODUCTS_JSON// }" ]; then
+            printf '%s' "$PRODUCTS_JSON" > "$products_file"
+            jq -e 'type == "array" and length > 0' "$products_file" >/dev/null
+            multi_product=true
+          else
+            if [ -z "${{ inputs.helm_release }}" ] || [ -z "${{ inputs.kube_namespace }}" ] || [ -z "${{ inputs.helm_chart }}" ] || [ -z "${{ inputs.helm_values_file }}" ]; then
+              echo "Single-product mode requires helm_release, kube_namespace, helm_chart, and helm_values_file (or provide products_json)." >&2
+              exit 1
+            fi
+            printf '[]' > "$products_file"
+          fi
 
           pr_number="${{ github.event.pull_request.number }}"
           source_ref="${{ github.sha }}"
@@ -129,6 +158,7 @@ jobs:
           fi
           short_sha="$(echo "$GITHUB_SHA" | cut -c1-7)"
           build_matrix='[]'
+          image_meta='{}'
           helm_set_args=''
 
           check_tag() {
@@ -168,9 +198,13 @@ jobs:
             dockerfile="$(jq -r '.dockerfile // "Dockerfile"' <<< "$image_config")"
             helm_tag_path="$(jq -r '.helmTagPath // empty' <<< "$image_config")"
 
-            if [ -z "$name" ] || [ -z "$image" ] || [ -z "$app_dir" ] || [ -z "$docker_target" ] || [ -z "$helm_tag_path" ]; then
-              echo "Each image entry requires name, image, appDir, dockerTarget, and helmTagPath." >&2
+            if [ -z "$name" ] || [ -z "$image" ] || [ -z "$app_dir" ] || [ -z "$docker_target" ]; then
+              echo "Each image entry requires name, image, appDir, and dockerTarget." >&2
               echo "$image_config" >&2
+              exit 1
+            fi
+            if [ "$multi_product" != "true" ] && [ -z "$helm_tag_path" ]; then
+              echo "Single-product mode requires helmTagPath on each image entry." >&2
               exit 1
             fi
 
@@ -194,7 +228,6 @@ jobs:
             cache_tag="$(printf '%s' "$docker_target" | tr -c 'A-Za-z0-9_.-' '-')"
             cache_ref="$image:buildcache-$cache_tag"
             # Shared monorepo deps cache across image names (same Dockerfile deps stage).
-            # Package: ghcr.io/<owner>/mm-buildcache:deps (and :deps-prN on open PRs).
             owner_segment="$(echo "$image" | cut -d'/' -f2)"
             shared_deps_image="${registry}/${owner_segment}/mm-buildcache"
             shared_deps_ref="${shared_deps_image}:deps"
@@ -240,11 +273,72 @@ jobs:
               build_matrix="$(jq -c --argjson item "$matrix_item" '. + [$item]' <<< "$build_matrix")"
             fi
 
-            if [ -n "$helm_set_args" ]; then
-              helm_set_args="${helm_set_args},"
+            image_meta="$(jq -c \
+              --arg name "$name" \
+              --arg tag "$image_tag" \
+              --arg helmTagPath "$helm_tag_path" \
+              '.[$name] = {tag:$tag, helmTagPath:$helmTagPath}' <<< "$image_meta")"
+
+            if [ -n "$helm_tag_path" ]; then
+              if [ -n "$helm_set_args" ]; then
+                helm_set_args="${helm_set_args},"
+              fi
+              helm_set_args="${helm_set_args}${helm_tag_path}=${image_tag}"
             fi
-            helm_set_args="${helm_set_args}${helm_tag_path}=${image_tag}"
           done < <(jq -c '.[]' "$images_file")
+
+          products_plan='[]'
+          if [ "$multi_product" = "true" ]; then
+            while IFS= read -r product_config; do
+              product_name="$(jq -r '.name // empty' <<< "$product_config")"
+              do_product_deploy="$(jq -r 'if has("do_deploy") then (.do_deploy|tostring) else "true" end' <<< "$product_config")"
+              image_names="$(jq -c '.image_names // []' <<< "$product_config")"
+              if [ -z "$product_name" ]; then
+                echo "Each product entry requires name." >&2
+                exit 1
+              fi
+              if [ "$(jq 'length' <<< "$image_names")" -eq 0 ]; then
+                echo "Product $product_name requires image_names." >&2
+                exit 1
+              fi
+
+              product_helm_set=''
+              while IFS= read -r img_name; do
+                [ -z "$img_name" ] && continue
+                meta="$(jq -c --arg n "$img_name" '.[$n] // empty' <<< "$image_meta")"
+                if [ -z "$meta" ] || [ "$meta" = "null" ]; then
+                  echo "Product $product_name references unknown image_name: $img_name" >&2
+                  exit 1
+                fi
+                tag="$(jq -r '.tag' <<< "$meta")"
+                path="$(jq -r '.helmTagPath // empty' <<< "$meta")"
+                # Prefer per-product helm tag path override map when present
+                override="$(jq -r --arg n "$img_name" '.helm_tag_paths[$n] // empty' <<< "$product_config")"
+                if [ -n "$override" ]; then
+                  path="$override"
+                fi
+                if [ -z "$path" ]; then
+                  echo "No helmTagPath for image $img_name (product $product_name)." >&2
+                  exit 1
+                fi
+                if [ -n "$product_helm_set" ]; then
+                  product_helm_set="${product_helm_set},"
+                fi
+                product_helm_set="${product_helm_set}${path}=${tag}"
+              done < <(jq -r '.[]' <<< "$image_names")
+
+              if [ "$do_product_deploy" != "true" ]; then
+                echo "Product $product_name is build-only (do_deploy=false); skipping deploy plan entry."
+                continue
+              fi
+
+              planned="$(jq -cn \
+                --argjson base "$product_config" \
+                --arg helm_set_args "$product_helm_set" \
+                '$base + {helm_set_args:$helm_set_args} | del(.image_names, .helm_tag_paths)')"
+              products_plan="$(jq -c --argjson item "$planned" '. + [$item]' <<< "$products_plan")"
+            done < <(jq -c '.[]' "$products_file")
+          fi
 
           should_build=false
           if [ "$(jq 'length' <<< "$build_matrix")" -gt 0 ]; then
@@ -257,14 +351,35 @@ jobs:
           fi
 
           should_deploy=false
-          if [ "${{ inputs.do_deploy }}" = "true" ] && { [ "$should_build" = "true" ] || [ "$operator_override" = "true" ] || [ "$is_merged_pr_close" = "true" ]; }; then
-            should_deploy=true
+          if [ "$multi_product" = "true" ]; then
+            if [ "$(jq 'length' <<< "$products_plan")" -gt 0 ] && { [ "$should_build" = "true" ] || [ "$operator_override" = "true" ] || [ "$is_merged_pr_close" = "true" ]; }; then
+              # Global do_deploy still gates multi-product deploys
+              if [ "${{ inputs.do_deploy }}" = "true" ]; then
+                should_deploy=true
+              fi
+            fi
+          else
+            if [ "${{ inputs.do_deploy }}" = "true" ] && { [ "$should_build" = "true" ] || [ "$operator_override" = "true" ] || [ "$is_merged_pr_close" = "true" ]; }; then
+              should_deploy=true
+            fi
           fi
 
-          echo "build_matrix=$build_matrix" >> "$GITHUB_OUTPUT"
-          echo "helm_set_args=$helm_set_args" >> "$GITHUB_OUTPUT"
-          echo "should_build=$should_build" >> "$GITHUB_OUTPUT"
-          echo "should_deploy=$should_deploy" >> "$GITHUB_OUTPUT"
+          echo "multi_product=$multi_product"
+          echo "should_build=$should_build"
+          echo "should_deploy=$should_deploy"
+          echo "images to build: $(jq -c '[.[].name]' <<< "$build_matrix")"
+          echo "products to deploy: $(jq -c '[.[].name]' <<< "$products_plan")"
+
+          {
+            echo "build_matrix=$build_matrix"
+            echo "helm_set_args=$helm_set_args"
+            echo "multi_product=$multi_product"
+            echo "should_build=$should_build"
+            echo "should_deploy=$should_deploy"
+            echo "products_plan<<PLAN_EOF"
+            echo "$products_plan"
+            echo "PLAN_EOF"
+          } >> "$GITHUB_OUTPUT"
 
   build:
     # Single job for all planned images so BuildKit shares intermediate stages
@@ -273,7 +388,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.should_build == 'true'
     runs-on: ${{ inputs.build_runner_label }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
@@ -399,15 +514,22 @@ jobs:
       needs.plan.outputs.should_deploy == 'true' &&
       (needs.build.result == 'success' || needs.build.result == 'skipped')
     runs-on: ${{ inputs.planning_runner_label }}
-    timeout-minutes: 10
+    timeout-minutes: 20
     permissions:
       contents: read
+    env:
+      MULTI_PRODUCT: ${{ needs.plan.outputs.multi_product }}
+      PRODUCTS_PLAN: ${{ needs.plan.outputs.products_plan }}
+      HELM_SET_ARGS: ${{ needs.plan.outputs.helm_set_args }}
+      GITOPS_REPOSITORY: ${{ inputs.gitops_repository }}
+      GITOPS_BRANCH: ${{ inputs.gitops_branch }}
+      GITOPS_WEBHOOK_URL: ${{ inputs.gitops_webhook_url }}
+      GITOPS_TARGET_REVISION: ${{ inputs.gitops_target_revision || github.head_ref || github.ref_name }}
     steps:
       - name: Plan Helm deploy mode
         id: helm_deploy
         shell: bash
         env:
-          GITOPS_REPOSITORY: ${{ inputs.gitops_repository }}
           KUBECONFIG_B64: ${{ secrets.kubeconfig_b64 }}
         run: |
           set -euo pipefail
@@ -447,16 +569,39 @@ jobs:
         if: steps.helm_deploy.outputs.enabled == 'true'
         shell: bash
         run: |
-          helm upgrade --install \
-            "${{ inputs.helm_release }}" \
-            "${{ inputs.helm_chart }}" \
-            -f "${{ inputs.helm_values_file }}" \
-            -n "${{ inputs.kube_namespace }}" \
-            --set-string "${{ needs.plan.outputs.helm_set_args }}" \
-            --rollback-on-failure \
-            --wait \
-            --timeout "${{ inputs.helm_timeout }}" \
-            --history-max 5
+          set -euo pipefail
+          if [ "$MULTI_PRODUCT" = "true" ]; then
+            while IFS= read -r product; do
+              release="$(jq -r '.helm_release' <<< "$product")"
+              chart="$(jq -r '.helm_chart' <<< "$product")"
+              values="$(jq -r '.helm_values_file' <<< "$product")"
+              namespace="$(jq -r '.kube_namespace' <<< "$product")"
+              timeout="$(jq -r '.helm_timeout // "3m"' <<< "$product")"
+              set_args="$(jq -r '.helm_set_args' <<< "$product")"
+              echo "Helm upgrade $release in $namespace"
+              helm upgrade --install \
+                "$release" \
+                "$chart" \
+                -f "$values" \
+                -n "$namespace" \
+                --set-string "$set_args" \
+                --rollback-on-failure \
+                --wait \
+                --timeout "$timeout" \
+                --history-max 5
+            done < <(jq -c '.[]' <<< "$PRODUCTS_PLAN")
+          else
+            helm upgrade --install \
+              "${{ inputs.helm_release }}" \
+              "${{ inputs.helm_chart }}" \
+              -f "${{ inputs.helm_values_file }}" \
+              -n "${{ inputs.kube_namespace }}" \
+              --set-string "$HELM_SET_ARGS" \
+              --rollback-on-failure \
+              --wait \
+              --timeout "${{ inputs.helm_timeout }}" \
+              --history-max 5
+          fi
 
       - name: Checkout GitOps repo
         if: inputs.gitops_repository != ''
@@ -468,83 +613,127 @@ jobs:
           path: gitops
           fetch-depth: 1
 
-      - name: Update GitOps application
+      - name: Update GitOps application(s)
         if: inputs.gitops_repository != ''
+        id: update_gitops
         shell: bash
         env:
           APPLICATION_FILE: ${{ inputs.gitops_application_file }}
-          HELM_SET_ARGS: ${{ needs.plan.outputs.helm_set_args }}
-          GITOPS_UPDATE_TARGET_REVISION: ${{ inputs.gitops_update_target_revision }}
-          GITOPS_TARGET_REVISION: ${{ inputs.gitops_target_revision || github.head_ref || github.ref_name }}
+          GITOPS_UPDATE_TARGET_REVISION_DEFAULT: ${{ inputs.gitops_update_target_revision }}
         run: |
           set -euo pipefail
-          if [ -z "$APPLICATION_FILE" ]; then
-            echo "gitops_application_file is required when gitops_repository is set." >&2
-            exit 1
-          fi
-          if [ -z "$HELM_SET_ARGS" ]; then
-            echo "No Helm image tag parameters were planned." >&2
-            exit 1
-          fi
+
           python3 - <<'PY'
           from pathlib import Path
           import json
           import os
 
-          path = Path("gitops") / os.environ["APPLICATION_FILE"]
-          if not path.exists():
-              raise SystemExit(f"{path} does not exist")
-
-          updates = {}
-          for item in os.environ["HELM_SET_ARGS"].split(","):
-              if "=" not in item:
-                  raise SystemExit(f"Invalid Helm set argument: {item}")
-              name, value = item.split("=", 1)
-              updates[name] = value
-
-          lines = path.read_text().splitlines()
-          current = None
-          seen = set()
-          for i, line in enumerate(lines):
-              stripped = line.strip()
-              if stripped.startswith("- name: "):
-                  name = stripped.removeprefix("- name: ").strip().strip('"').strip("'")
-                  current = name if name in updates else None
-              elif stripped.startswith("name: "):
-                  name = stripped.removeprefix("name: ").strip().strip('"').strip("'")
-                  current = name if name in updates else None
-              elif current and stripped.startswith("value:"):
-                  indent = line[:len(line) - len(line.lstrip())]
-                  lines[i] = f"{indent}value: {updates[current]}"
-                  seen.add(current)
-                  current = None
-
-          missing = sorted(set(updates) - seen)
-          if missing:
-              raise SystemExit(f"Missing Helm parameter(s) in {path}: {', '.join(missing)}")
-
-          update_target_revision = os.environ.get("GITOPS_UPDATE_TARGET_REVISION") == "true"
-          target_revision = os.environ.get("GITOPS_TARGET_REVISION", "").strip()
-          if update_target_revision:
-              if not target_revision:
-                  raise SystemExit("gitops_update_target_revision is true but no target revision was resolved")
+          def apply_updates(path: Path, updates: dict, update_target_revision: bool, target_revision: str) -> None:
+              if not path.exists():
+                  raise SystemExit(f"{path} does not exist")
+              lines = path.read_text().splitlines()
+              current = None
+              seen = set()
               for i, line in enumerate(lines):
                   stripped = line.strip()
-                  if stripped.startswith("targetRevision:"):
-                      indent = line[:len(line) - len(line.lstrip())]
-                      lines[i] = f"{indent}targetRevision: {json.dumps(target_revision)}"
-                      break
-              else:
-                  raise SystemExit(f"Missing targetRevision in {path}")
+                  if stripped.startswith("- name: "):
+                      name = stripped.removeprefix("- name: ").strip().strip('"').strip("'")
+                      current = name if name in updates else None
+                  elif stripped.startswith("name: "):
+                      name = stripped.removeprefix("name: ").strip().strip('"').strip("'")
+                      current = name if name in updates else None
+                  elif current and stripped.startswith("value:"):
+                      indent = line[: len(line) - len(line.lstrip())]
+                      lines[i] = f"{indent}value: {updates[current]}"
+                      seen.add(current)
+                      current = None
 
-          path.write_text("\n".join(lines) + "\n")
+              missing = sorted(set(updates) - seen)
+              if missing:
+                  raise SystemExit(f"Missing Helm parameter(s) in {path}: {', '.join(missing)}")
+
+              if update_target_revision:
+                  if not target_revision:
+                      raise SystemExit("gitops_update_target_revision is true but no target revision was resolved")
+                  for i, line in enumerate(lines):
+                      stripped = line.strip()
+                      if stripped.startswith("targetRevision:"):
+                          indent = line[: len(line) - len(line.lstrip())]
+                          lines[i] = f"{indent}targetRevision: {json.dumps(target_revision)}"
+                          break
+                  else:
+                      raise SystemExit(f"Missing targetRevision in {path}")
+
+              path.write_text("\n".join(lines) + "\n")
+
+          multi = os.environ.get("MULTI_PRODUCT") == "true"
+          target_revision = os.environ.get("GITOPS_TARGET_REVISION", "").strip()
+          changed_files = []
+          release_names = []
+
+          if multi:
+              products = json.loads(os.environ.get("PRODUCTS_PLAN") or "[]")
+              if not products:
+                  raise SystemExit("No products planned for GitOps update")
+              for product in products:
+                  app_file = product.get("gitops_application_file") or ""
+                  if not app_file:
+                      raise SystemExit(f"Product {product.get('name')} missing gitops_application_file")
+                  helm_set = product.get("helm_set_args") or ""
+                  if not helm_set:
+                      raise SystemExit(f"Product {product.get('name')} missing helm_set_args")
+                  updates = {}
+                  for item in helm_set.split(","):
+                      if "=" not in item:
+                          raise SystemExit(f"Invalid Helm set argument: {item}")
+                      name, value = item.split("=", 1)
+                      updates[name] = value
+                  update_tr = product.get("gitops_update_target_revision")
+                  if update_tr is None:
+                      update_tr = os.environ.get("GITOPS_UPDATE_TARGET_REVISION_DEFAULT") == "true"
+                  else:
+                      update_tr = bool(update_tr)
+                  path = Path("gitops") / app_file
+                  apply_updates(path, updates, update_tr, target_revision)
+                  changed_files.append(app_file)
+                  release_names.append(product.get("helm_release") or product.get("name") or app_file)
+          else:
+              app_file = os.environ.get("APPLICATION_FILE") or ""
+              helm_set = os.environ.get("HELM_SET_ARGS") or ""
+              if not app_file:
+                  raise SystemExit("gitops_application_file is required when gitops_repository is set.")
+              if not helm_set:
+                  raise SystemExit("No Helm image tag parameters were planned.")
+              updates = {}
+              for item in helm_set.split(","):
+                  if "=" not in item:
+                      raise SystemExit(f"Invalid Helm set argument: {item}")
+                  name, value = item.split("=", 1)
+                  updates[name] = value
+              update_tr = os.environ.get("GITOPS_UPDATE_TARGET_REVISION_DEFAULT") == "true"
+              path = Path("gitops") / app_file
+              apply_updates(path, updates, update_tr, target_revision)
+              changed_files.append(app_file)
+              release_names.append(os.environ.get("HELM_RELEASE") or app_file)
+
+          Path("/tmp/gitops-files.txt").write_text("\n".join(changed_files) + "\n")
+          Path("/tmp/gitops-releases.txt").write_text(", ".join(release_names))
+          print("Updated:", ", ".join(changed_files))
           PY
+
+          echo "files<<EOF" >> "$GITHUB_OUTPUT"
+          cat /tmp/gitops-files.txt >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "releases=$(cat /tmp/gitops-releases.txt)" >> "$GITHUB_OUTPUT"
 
       - name: Push GitOps update
         id: push_gitops_update
         if: inputs.gitops_repository != ''
         working-directory: gitops
         shell: bash
+        env:
+          CHANGED_FILES: ${{ steps.update_gitops.outputs.files }}
+          RELEASES: ${{ steps.update_gitops.outputs.releases }}
         run: |
           set -euo pipefail
           if git diff --quiet; then
@@ -554,8 +743,16 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "${{ inputs.gitops_application_file }}"
-          git commit -m "Update ${{ inputs.helm_release }} GitOps deployment"
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            git add "$f"
+          done <<< "$CHANGED_FILES"
+          if [ "$MULTI_PRODUCT" = "true" ]; then
+            msg="Update GitOps deployments: $RELEASES"
+          else
+            msg="Update ${{ inputs.helm_release }} GitOps deployment"
+          fi
+          git commit -m "$msg"
           for attempt in 1 2 3 4 5; do
             git fetch origin "${{ inputs.gitops_branch }}"
             git rebase "origin/${{ inputs.gitops_branch }}"
@@ -574,9 +771,7 @@ jobs:
         working-directory: gitops
         shell: bash
         env:
-          GITOPS_WEBHOOK_URL: ${{ inputs.gitops_webhook_url }}
           GITOPS_WEBHOOK_SECRET: ${{ secrets.gitops_webhook_secret }}
-          GITOPS_BRANCH: ${{ inputs.gitops_branch }}
         run: |
           set -euo pipefail
           if [ -z "$GITOPS_WEBHOOK_URL" ]; then
