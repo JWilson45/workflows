@@ -93,7 +93,7 @@ jobs:
     steps:
       - name: Plan image builds
         id: plan
-        uses: ./.github/actions/plan-images
+        uses: JWilson45/workflows/.github/actions/plan-images@v3.4.1
         with:
           images_json: ${{ inputs.images_json }}
           products_json: ${{ inputs.products_json }}
