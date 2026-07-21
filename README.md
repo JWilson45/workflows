@@ -24,6 +24,8 @@ To create a release:
 
   **Multi-product (atomic) deploy:** pass `products_json` (array of products with `name`, `image_names`, `kube_namespace`, `helm_release`, `helm_chart`, `helm_values_file`, `gitops_application_file`, optional `do_deploy`, `helm_timeout`, `gitops_update_target_revision`). All deployable products are updated in **one GitOps commit** and one Argo webhook. Single-product callers can keep using `helm_release` / `kube_namespace` / `helm_values_file` / `gitops_application_file` without `products_json`.
 
+  **Registry tag probes (plan):** GHCR existence checks authenticate with `GITHUB_TOKEN` (`packages: read`) and cache one pull token per repository for the plan job, avoiding anonymous `ghcr.io/token` minting that hits low rate limits on multi-image monorepo plans.
+
   For pull request builds, image tags are suffixed as `${version}-pr${number}-${sha}` and the `latest` tag is not updated.
 
 - `.github/workflows/cleanup-pr-images.yaml` – Manually triggered workflow that removes PR-tagged GHCR container versions, PR-specific build caches, and untagged GHCR versions. It supports deleting all PR artifacts for a package or only specific PR numbers, with a `dry-run` preview mode.
