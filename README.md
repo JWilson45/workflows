@@ -20,7 +20,7 @@ To create a release:
 
 ## Available workflows
 
-- `.github/workflows/build-and-deploy.yaml` – Builds and pushes a container image to GitHub Container Registry (GHCR), can deploy the image to Kubernetes clusters, and creates a GitHub Release for the calling project. For pull request builds, the image tag is suffixed as `${version}-pr${number}-${sha}` and the `latest` tag is not updated.
+- `.github/workflows/build-and-deploy.yaml` – Plans, builds, and optionally deploys one or more container images. When `images_json` lists multiple images, they are built in a **single** `docker buildx bake` job (one DinD runner) so monorepo multi-stage Dockerfiles share intermediate layers such as `deps`. Images are pushed to GHCR (or other registries in the image refs). Deploy can update Helm and/or a GitOps repository. For pull request builds, image tags are suffixed as `${version}-pr${number}-${sha}` and the `latest` tag is not updated.
 
 - `.github/workflows/cleanup-pr-images.yaml` – Manually triggered workflow that removes PR-tagged GHCR container versions, PR-specific build caches, and untagged GHCR versions. It supports deleting all PR artifacts for a package or only specific PR numbers, with a `dry-run` preview mode.
 
