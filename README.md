@@ -20,11 +20,15 @@ To create a release:
 
 ## Available workflows
 
-- `.github/workflows/build-and-deploy.yaml` – Plans, builds, and optionally deploys one or more container images. When `images_json` lists multiple images, they are built in a **single** `docker buildx bake` job (one DinD runner) so monorepo multi-stage Dockerfiles share intermediate layers such as `deps`. Images are pushed to GHCR (or other registries in the image refs).
+- `.github/workflows/build-images.yaml` – **Single job (Bake):** plan tags + `docker buildx bake` for one or more images. Prefer this for monorepo CI build stages.
 
-  **Multi-product (atomic) deploy:** pass `products_json` (array of products with `name`, `image_names`, `kube_namespace`, `helm_release`, `helm_chart`, `helm_values_file`, `gitops_application_file`, optional `do_deploy`, `helm_timeout`, `gitops_update_target_revision`). All deployable products are updated in **one GitOps commit** and one Argo webhook. Single-product callers can keep using `helm_release` / `kube_namespace` / `helm_values_file` / `gitops_application_file` without `products_json`.
+- `.github/workflows/deploy-products.yaml` – **Single job (Ship):** plan tags + Helm and/or atomic multi-product GitOps. Prefer this for monorepo CI deploy stages gated on tests.
 
-  **Registry tag probes (plan):** GHCR existence checks authenticate with `GITHUB_TOKEN` (`packages: read`) and cache one pull token per repository for the plan job, avoiding anonymous `ghcr.io/token` minting that hits low rate limits on multi-image monorepo plans.
+- `.github/workflows/build-and-deploy.yaml` – Combined Bake → Ship for single-call callers (`phase=all`, default). Also supports `phase=build` / `phase=deploy` for one-job-only calls. Prefer the dedicated workflows above for the shortest Actions graph.
+
+  **Multi-product (atomic) deploy:** pass `products_json` (array of products with `name`, `image_names`, `kube_namespace`, `helm_release`, `helm_chart`, `helm_values_file`, `gitops_application_file`, optional `do_deploy`, `helm_timeout`, `gitops_update_target_revision`). All deployable products are updated in **one GitOps commit** and one Argo webhook.
+
+  **Registry tag probes:** GHCR checks authenticate with `GITHUB_TOKEN` and cache one pull token per repository.
 
   For pull request builds, image tags are suffixed as `${version}-pr${number}-${sha}` and the `latest` tag is not updated.
 
