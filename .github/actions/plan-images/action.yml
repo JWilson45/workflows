@@ -1,0 +1,64 @@
+name: Plan images
+description: Plan image tags, build matrix, and multi-product Helm/GitOps args
+inputs:
+  images_json:
+    required: true
+    description: JSON array of images
+  products_json:
+    required: false
+    default: ""
+    description: JSON array of products (multi-product mode)
+  do_deploy:
+    required: true
+    description: "true or false"
+  helm_release:
+    required: false
+    default: ""
+  kube_namespace:
+    required: false
+    default: ""
+  helm_chart:
+    required: false
+    default: ""
+  helm_values_file:
+    required: false
+    default: ""
+outputs:
+  build_matrix:
+    description: Images that need building
+    value: ${{ steps.plan.outputs.build_matrix }}
+  helm_set_args:
+    description: Single-product helm set args
+    value: ${{ steps.plan.outputs.helm_set_args }}
+  products_plan:
+    description: Multi-product deploy plan
+    value: ${{ steps.plan.outputs.products_plan }}
+  multi_product:
+    description: Whether multi-product mode is active
+    value: ${{ steps.plan.outputs.multi_product }}
+  should_build:
+    description: Whether any image needs building
+    value: ${{ steps.plan.outputs.should_build }}
+  should_deploy:
+    description: Whether deploy should run
+    value: ${{ steps.plan.outputs.should_deploy }}
+runs:
+  using: composite
+  steps:
+    - id: plan
+      shell: bash
+      env:
+        IMAGES_JSON: ${{ inputs.images_json }}
+        PRODUCTS_JSON: ${{ inputs.products_json }}
+        DO_DEPLOY: ${{ inputs.do_deploy }}
+        HELM_RELEASE: ${{ inputs.helm_release }}
+        KUBE_NAMESPACE: ${{ inputs.kube_namespace }}
+        HELM_CHART: ${{ inputs.helm_chart }}
+        HELM_VALUES_FILE: ${{ inputs.helm_values_file }}
+        GH_TOKEN: ${{ github.token }}
+        GH_ACTOR: ${{ github.actor }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        PR_MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        PR_MERGED: ${{ github.event.pull_request.merged }}
+        GITHUB_EVENT_ACTION: ${{ github.event.action }}
+      run: bash "${{ github.action_path }}/plan-images.sh"

@@ -1,30 +1,15 @@
-name: Build & Deploy Images
+name: Deploy Products
+
+# Single-job reusable workflow: plan tags + Helm/GitOps ship.
+# Intended for monorepo CI graphs that gate deploy on test + bake.
 
 on:
   workflow_call:
     inputs:
       images_json:
-        description: JSON array of images to plan/build (name, image, appDir, dockerTarget, helmTagPath, optional context/dockerfile)
         required: true
         type: string
       products_json:
-        description: JSON array of products to deploy atomically (optional). See README.
-        required: false
-        default: ""
-        type: string
-      # all = bake then ship (legacy single call). build = bake only. deploy = ship only.
-      # Using phase=build + phase=deploy from the caller yields a short Actions graph
-      # (no skipped plan/build/deploy triplets).
-      phase:
-        description: "all | build | deploy"
-        required: false
-        default: all
-        type: string
-      platforms:
-        required: false
-        default: linux/amd64
-        type: string
-      kube_namespace:
         required: false
         default: ""
         type: string
@@ -32,9 +17,9 @@ on:
         required: false
         default: mm-runner-set-no-dind
         type: string
-      build_runner_label:
+      kube_namespace:
         required: false
-        default: mm-runner-set
+        default: ""
         type: string
       helm_release:
         required: false
@@ -83,169 +68,14 @@ on:
     secrets:
       kubeconfig_b64:
         required: false
-      dockerhub_username:
-        required: false
-      dockerhub_token:
-        required: false
       gitops_token:
         required: false
       gitops_webhook_secret:
         required: false
 
 jobs:
-  # Single job for image planning + bake (no separate plan / skipped deploy nodes).
-  bake:
-    name: Bake
-    if: ${{ inputs.phase == 'build' || inputs.phase == 'all' }}
-    runs-on: ${{ inputs.build_runner_label }}
-    timeout-minutes: 60
-    concurrency:
-      group: ${{ github.workflow }}-${{ inputs.helm_release != '' && inputs.helm_release || 'multi' }}-bake-${{ github.ref }}
-      cancel-in-progress: true
-    permissions:
-      contents: read
-      pull-requests: read
-      packages: write
-      id-token: write
-      attestations: write
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v6
-        with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merge_commit_sha || github.sha }}
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Plan image builds
-        id: plan
-        uses: ./.github/actions/plan-images
-        with:
-          images_json: ${{ inputs.images_json }}
-          products_json: ${{ inputs.products_json }}
-          do_deploy: ${{ inputs.do_deploy }}
-          helm_release: ${{ inputs.helm_release }}
-          kube_namespace: ${{ inputs.kube_namespace }}
-          helm_chart: ${{ inputs.helm_chart }}
-          helm_values_file: ${{ inputs.helm_values_file }}
-
-      - name: Set up Docker Buildx
-        if: steps.plan.outputs.should_build == 'true'
-        uses: docker/setup-buildx-action@v4
-
-      - name: Log in to image registries
-        if: steps.plan.outputs.should_build == 'true'
-        shell: bash
-        env:
-          BUILD_MATRIX: ${{ steps.plan.outputs.build_matrix }}
-          REGISTRY_USER: ${{ github.actor }}
-          REGISTRY_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          while IFS= read -r registry; do
-            [ -z "$registry" ] && continue
-            echo "Logging in to $registry"
-            echo "$REGISTRY_TOKEN" | docker login "$registry" -u "$REGISTRY_USER" --password-stdin
-          done < <(jq -r '.[].registry' <<< "$BUILD_MATRIX" | sort -u)
-
-      - name: Check Docker Hub credentials
-        id: dockerhub
-        if: steps.plan.outputs.should_build == 'true'
-        shell: bash
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.dockerhub_username }}
-          DOCKERHUB_TOKEN: ${{ secrets.dockerhub_token }}
-        run: |
-          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Log in to Docker Hub
-        if: steps.plan.outputs.should_build == 'true' && steps.dockerhub.outputs.enabled == 'true'
-        uses: docker/login-action@v4
-        with:
-          username: ${{ secrets.dockerhub_username }}
-          password: ${{ secrets.dockerhub_token }}
-
-      - name: Generate bake file and build all images
-        if: steps.plan.outputs.should_build == 'true'
-        shell: bash
-        env:
-          BUILD_MATRIX: ${{ steps.plan.outputs.build_matrix }}
-          PLATFORMS: ${{ inputs.platforms }}
-        run: |
-          set -euo pipefail
-
-          image_count="$(jq 'length' <<< "$BUILD_MATRIX")"
-          if [ "$image_count" -eq 0 ]; then
-            echo "No images to build."
-            exit 0
-          fi
-
-          platforms_json="$(printf '%s' "$PLATFORMS" | tr ',' '\n' | sed '/^$/d' | jq -R . | jq -s -c .)"
-          bake_file="$(mktemp)"
-
-          jq -n \
-            --argjson images "$BUILD_MATRIX" \
-            --argjson platforms "$platforms_json" \
-            '
-            def lines:
-              if . == null or . == "" then []
-              else (split("\n") | map(select(length > 0)))
-              end;
-
-            {
-              group: {
-                default: {
-                  targets: [ $images[].name ]
-                }
-              },
-              target: (
-                [ $images[] | {
-                    key: .name,
-                    value: (
-                      {
-                        context: .dockerContext,
-                        dockerfile: .dockerfile,
-                        target: .dockerTarget,
-                        tags: (.tags | lines),
-                        platforms: $platforms,
-                        output: ["type=image,push=true"],
-                        attest: [
-                          "type=provenance,mode=max",
-                          "type=sbom"
-                        ]
-                      }
-                      + (if (.cacheFrom | lines | length) > 0
-                         then { "cache-from": (.cacheFrom | lines) }
-                         else {} end)
-                      + (if (.cacheTo | lines | length) > 0
-                         then { "cache-to": (.cacheTo | lines) }
-                         else {} end)
-                    )
-                  }
-                ] | from_entries
-              )
-            }
-            ' > "$bake_file"
-
-          echo "Bake definition ($image_count image(s)):"
-          jq . "$bake_file"
-
-          echo "Building with docker buildx bake..."
-          docker buildx bake -f "$bake_file"
-
-  # Single job for plan + GitOps/Helm ship (no separate plan / skipped bake nodes).
   ship:
     name: Ship
-    needs: [bake]
-    if: >-
-      always() &&
-      (
-        inputs.phase == 'deploy' ||
-        (inputs.phase == 'all' && (needs.bake.result == 'success' || needs.bake.result == 'skipped'))
-      )
     runs-on: ${{ inputs.planning_runner_label }}
     timeout-minutes: 20
     concurrency:
