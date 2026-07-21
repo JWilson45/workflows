@@ -244,4 +244,8 @@ jobs:
           jq . "$bake_file"
 
           echo "Building with docker buildx bake (progress=plain for stage timings)..."
-          docker buildx bake --progress=plain -f "$bake_file"
+          # Local cache-from/to needs an explicit FS entitlement with recent buildx.
+          docker buildx bake \
+            --allow="fs=${LOCAL_CACHE_DIR}" \
+            --progress=plain \
+            -f "$bake_file"
