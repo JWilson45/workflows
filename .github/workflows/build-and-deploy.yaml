@@ -106,8 +106,6 @@ jobs:
     env:
       IMAGES_JSON: ${{ inputs.images_json }}
       PRODUCTS_JSON: ${{ inputs.products_json }}
-      IS_MANUAL: ${{ github.event_name == 'workflow_dispatch' }}
-      IS_RERUN: ${{ github.run_attempt > 1 }}
     steps:
       - name: Plan image builds
         id: plan
@@ -142,10 +140,6 @@ jobs:
           is_open_pr_context=false
           if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ github.event.action }}" != "closed" ]; then
             is_open_pr_context=true
-          fi
-          is_merged_pr_close=false
-          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ github.event.action }}" = "closed" ] && [ "${{ github.event.pull_request.merged }}" = "true" ]; then
-            is_merged_pr_close=true
           fi
           if [ -z "$cache_pr_number" ] && [ "${{ github.event_name }}" = "push" ]; then
             associated_prs_json="$(curl -fsSL \
@@ -345,21 +339,17 @@ jobs:
             should_build=true
           fi
 
-          operator_override=false
-          if [ "$IS_MANUAL" = "true" ] || [ "$IS_RERUN" = "true" ]; then
-            operator_override=true
-          fi
-
+          # Deploy is independent of whether any image needs a rebuild. Callers that
+          # split build/deploy (or only change helm values) still need GitOps updates
+          # when tags already exist. No-op tag writes are harmless: the GitOps step
+          # skips the commit when the Application files are unchanged.
           should_deploy=false
-          if [ "$multi_product" = "true" ]; then
-            if [ "$(jq 'length' <<< "$products_plan")" -gt 0 ] && { [ "$should_build" = "true" ] || [ "$operator_override" = "true" ] || [ "$is_merged_pr_close" = "true" ]; }; then
-              # Global do_deploy still gates multi-product deploys
-              if [ "${{ inputs.do_deploy }}" = "true" ]; then
+          if [ "${{ inputs.do_deploy }}" = "true" ]; then
+            if [ "$multi_product" = "true" ]; then
+              if [ "$(jq 'length' <<< "$products_plan")" -gt 0 ]; then
                 should_deploy=true
               fi
-            fi
-          else
-            if [ "${{ inputs.do_deploy }}" = "true" ] && { [ "$should_build" = "true" ] || [ "$operator_override" = "true" ] || [ "$is_merged_pr_close" = "true" ]; }; then
+            elif [ -n "$helm_set_args" ]; then
               should_deploy=true
             fi
           fi
@@ -619,6 +609,7 @@ jobs:
         shell: bash
         env:
           APPLICATION_FILE: ${{ inputs.gitops_application_file }}
+          HELM_RELEASE: ${{ inputs.helm_release }}
           GITOPS_UPDATE_TARGET_REVISION_DEFAULT: ${{ inputs.gitops_update_target_revision }}
         run: |
           set -euo pipefail
