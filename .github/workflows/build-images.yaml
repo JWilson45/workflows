@@ -1,8 +1,8 @@
 name: Build Images
 
 # Single-job reusable workflow: plan tags + docker bake.
-# Optimizations: amd64-focused, local BuildKit cache, env-tier attestations,
-# plain progress for stage timing in logs.
+# Registry cache only (no local cache) — suitable for ephemeral runners.
+# Env-tier attestations + plain progress for stage timings.
 
 on:
   workflow_call:
@@ -27,11 +27,6 @@ on:
       registry_cache_mode:
         required: false
         default: min
-        type: string
-      # Persistent path on self-hosted runners; falls back to RUNNER_TEMP if unwritable
-      buildx_cache_dir:
-        required: false
-        default: /var/cache/buildx
         type: string
       build_runner_label:
         required: false
@@ -83,7 +78,7 @@ jobs:
 
       - name: Plan image builds
         id: plan
-        uses: JWilson45/workflows/.github/actions/plan-images@v3.5.0
+        uses: JWilson45/workflows/.github/actions/plan-images@v3.5.3
         with:
           images_json: ${{ inputs.images_json }}
           products_json: ${{ inputs.products_json }}
@@ -92,24 +87,6 @@ jobs:
           kube_namespace: ${{ inputs.kube_namespace }}
           helm_chart: ${{ inputs.helm_chart }}
           helm_values_file: ${{ inputs.helm_values_file }}
-
-      - name: Resolve local BuildKit cache dir
-        id: cache_dir
-        if: steps.plan.outputs.should_build == 'true'
-        shell: bash
-        env:
-          PREFERRED: ${{ inputs.buildx_cache_dir }}
-        run: |
-          set -euo pipefail
-          dir="$PREFERRED"
-          if ! mkdir -p "$dir" 2>/dev/null || [ ! -w "$dir" ]; then
-            dir="${RUNNER_TEMP}/buildx-cache"
-            mkdir -p "$dir"
-            echo "Preferred cache dir not writable; using $dir"
-          else
-            echo "Using local BuildKit cache at $dir"
-          fi
-          echo "path=$dir" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         if: steps.plan.outputs.should_build == 'true'
@@ -161,7 +138,6 @@ jobs:
           PLATFORMS: ${{ inputs.platforms }}
           ATTEST_MODE: ${{ inputs.attest_mode }}
           REGISTRY_CACHE_MODE: ${{ inputs.registry_cache_mode }}
-          LOCAL_CACHE_DIR: ${{ steps.cache_dir.outputs.path }}
         run: |
           set -euo pipefail
 
@@ -174,14 +150,13 @@ jobs:
           platforms_json="$(printf '%s' "$PLATFORMS" | tr ',' '\n' | sed '/^$/d' | jq -R . | jq -s -c .)"
           bake_file="$(mktemp)"
 
-          # Rewrite registry cache-to mode and always layer local BuildKit cache.
-          # Plain progress prints per-stage timings in the job log for measurement.
+          # Registry cache only — ephemeral runners make type=local cache pure overhead
+          # (export at end of job, then disk is thrown away).
           jq -n \
             --argjson images "$BUILD_MATRIX" \
             --argjson platforms "$platforms_json" \
             --arg attest "$ATTEST_MODE" \
             --arg reg_mode "$REGISTRY_CACHE_MODE" \
-            --arg local_cache "$LOCAL_CACHE_DIR" \
             '
             def lines:
               if . == null or . == "" then []
@@ -220,16 +195,14 @@ jobs:
                         target: .dockerTarget,
                         tags: (.tags | lines),
                         platforms: $platforms,
-                        output: ["type=image,push=true"],
-                        "cache-from": (
-                          ["type=local,src=\($local_cache)"]
-                          + (.cacheFrom | lines)
-                        ),
-                        "cache-to": (
-                          ["type=local,dest=\($local_cache),mode=max"]
-                          + ((.cacheTo | lines) | normalize_cache_to)
-                        )
+                        output: ["type=image,push=true"]
                       }
+                      + (if (.cacheFrom | lines | length) > 0
+                         then { "cache-from": (.cacheFrom | lines) }
+                         else {} end)
+                      + (if (.cacheTo | lines | length) > 0
+                         then { "cache-to": ((.cacheTo | lines) | normalize_cache_to) }
+                         else {} end)
                       + (if (attest_list | length) > 0
                          then { attest: attest_list }
                          else {} end)
@@ -240,12 +213,8 @@ jobs:
             }
             ' > "$bake_file"
 
-          echo "Bake definition ($image_count image(s)); attest=$ATTEST_MODE registry_cache=$REGISTRY_CACHE_MODE local_cache=$LOCAL_CACHE_DIR"
+          echo "Bake definition ($image_count image(s)); attest=$ATTEST_MODE registry_cache=$REGISTRY_CACHE_MODE"
           jq . "$bake_file"
 
           echo "Building with docker buildx bake (progress=plain for stage timings)..."
-          # Local cache-from/to needs an explicit FS entitlement with recent buildx.
-          docker buildx bake \
-            --allow="fs=${LOCAL_CACHE_DIR}" \
-            --progress=plain \
-            -f "$bake_file"
+          docker buildx bake --progress=plain -f "$bake_file"
