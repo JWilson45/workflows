@@ -131,7 +131,7 @@ jobs:
 
       - name: Set up Helm
         if: steps.plan.outputs.should_deploy == 'true' && steps.helm_deploy.outputs.enabled == 'true'
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
 
       - name: Load kubeconfig
         if: steps.plan.outputs.should_deploy == 'true' && steps.helm_deploy.outputs.enabled == 'true'
