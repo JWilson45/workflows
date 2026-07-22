@@ -13,6 +13,14 @@ on:
         required: false
         default: ""
         type: string
+      use_preplanned_plan:
+        required: false
+        default: false
+        type: boolean
+      preplanned_products_plan:
+        required: false
+        default: "[]"
+        type: string
       planning_runner_label:
         required: false
         default: mm-runner-set-no-dind
@@ -65,6 +73,10 @@ on:
         required: false
         default: ""
         type: string
+      gitops_webhook_urls_json:
+        required: false
+        default: "{}"
+        type: string
     secrets:
       kubeconfig_b64:
         required: false
@@ -89,10 +101,12 @@ jobs:
       GITOPS_REPOSITORY: ${{ inputs.gitops_repository }}
       GITOPS_BRANCH: ${{ inputs.gitops_branch }}
       GITOPS_WEBHOOK_URL: ${{ inputs.gitops_webhook_url }}
+      GITOPS_WEBHOOK_URLS_JSON: ${{ inputs.gitops_webhook_urls_json }}
       GITOPS_TARGET_REVISION: ${{ inputs.gitops_target_revision || github.head_ref || github.ref_name }}
     steps:
       - name: Plan image builds
         id: plan
+        if: inputs.use_preplanned_plan != true
         uses: JWilson45/workflows/.github/actions/plan-images@v3.5.3
         with:
           images_json: ${{ inputs.images_json }}
@@ -103,14 +117,47 @@ jobs:
           helm_chart: ${{ inputs.helm_chart }}
           helm_values_file: ${{ inputs.helm_values_file }}
 
+      - name: Resolve deployment plan
+        id: resolved_plan
+        shell: bash
+        env:
+          USE_PREPLANNED_PLAN: ${{ inputs.use_preplanned_plan }}
+          PREPLANNED_PRODUCTS_PLAN: ${{ inputs.preplanned_products_plan }}
+          PLANNED_PRODUCTS_PLAN: ${{ steps.plan.outputs.products_plan }}
+          PLANNED_MULTI_PRODUCT: ${{ steps.plan.outputs.multi_product }}
+          PLANNED_HELM_SET_ARGS: ${{ steps.plan.outputs.helm_set_args }}
+          PLANNED_SHOULD_DEPLOY: ${{ steps.plan.outputs.should_deploy }}
+        run: |
+          set -euo pipefail
+          if [ "$USE_PREPLANNED_PLAN" = "true" ]; then
+            products_plan="$PREPLANNED_PRODUCTS_PLAN"
+            jq -e 'type == "array"' <<< "$products_plan" >/dev/null
+            multi_product=true
+            if [ "$(jq 'length' <<< "$products_plan")" -gt 0 ]; then
+              should_deploy=true
+            else
+              should_deploy=false
+            fi
+            helm_set_args=""
+          else
+            products_plan="$PLANNED_PRODUCTS_PLAN"
+            multi_product="$PLANNED_MULTI_PRODUCT"
+            should_deploy="$PLANNED_SHOULD_DEPLOY"
+            helm_set_args="$PLANNED_HELM_SET_ARGS"
+          fi
+          echo "products_plan=$products_plan" >> "$GITHUB_OUTPUT"
+          echo "multi_product=$multi_product" >> "$GITHUB_OUTPUT"
+          echo "should_deploy=$should_deploy" >> "$GITHUB_OUTPUT"
+          echo "helm_set_args=$helm_set_args" >> "$GITHUB_OUTPUT"
+
       - name: Skip ship when plan says no deploy
-        if: steps.plan.outputs.should_deploy != 'true'
+        if: steps.resolved_plan.outputs.should_deploy != 'true'
         shell: bash
         run: echo "should_deploy=false; nothing to ship."
 
       - name: Plan Helm deploy mode
         id: helm_deploy
-        if: steps.plan.outputs.should_deploy == 'true'
+        if: steps.resolved_plan.outputs.should_deploy == 'true'
         shell: bash
         env:
           KUBECONFIG_B64: ${{ secrets.kubeconfig_b64 }}
@@ -123,18 +170,18 @@ jobs:
           echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
 
       - name: Checkout repo
-        if: steps.plan.outputs.should_deploy == 'true' && steps.helm_deploy.outputs.enabled == 'true'
+        if: steps.resolved_plan.outputs.should_deploy == 'true' && steps.helm_deploy.outputs.enabled == 'true'
         uses: actions/checkout@v6
         with:
           fetch-depth: 1
           persist-credentials: false
 
       - name: Set up Helm
-        if: steps.plan.outputs.should_deploy == 'true' && steps.helm_deploy.outputs.enabled == 'true'
+        if: steps.resolved_plan.outputs.should_deploy == 'true' && steps.helm_deploy.outputs.enabled == 'true'
         uses: azure/setup-helm@v5
 
       - name: Load kubeconfig
-        if: steps.plan.outputs.should_deploy == 'true' && steps.helm_deploy.outputs.enabled == 'true'
+        if: steps.resolved_plan.outputs.should_deploy == 'true' && steps.helm_deploy.outputs.enabled == 'true'
         shell: bash
         env:
           KUBECONFIG_B64: ${{ secrets.kubeconfig_b64 }}
@@ -149,12 +196,12 @@ jobs:
           chmod 600 "$HOME/.kube/config"
 
       - name: Helm upgrade/install
-        if: steps.plan.outputs.should_deploy == 'true' && steps.helm_deploy.outputs.enabled == 'true'
+        if: steps.resolved_plan.outputs.should_deploy == 'true' && steps.helm_deploy.outputs.enabled == 'true'
         shell: bash
         env:
-          MULTI_PRODUCT: ${{ steps.plan.outputs.multi_product }}
-          PRODUCTS_PLAN: ${{ steps.plan.outputs.products_plan }}
-          HELM_SET_ARGS: ${{ steps.plan.outputs.helm_set_args }}
+          MULTI_PRODUCT: ${{ steps.resolved_plan.outputs.multi_product }}
+          PRODUCTS_PLAN: ${{ steps.resolved_plan.outputs.products_plan }}
+          HELM_SET_ARGS: ${{ steps.resolved_plan.outputs.helm_set_args }}
         run: |
           set -euo pipefail
           if [ "$MULTI_PRODUCT" = "true" ]; then
@@ -191,7 +238,7 @@ jobs:
           fi
 
       - name: Checkout GitOps repo
-        if: steps.plan.outputs.should_deploy == 'true' && inputs.gitops_repository != ''
+        if: steps.resolved_plan.outputs.should_deploy == 'true' && inputs.gitops_repository != ''
         uses: actions/checkout@v6
         with:
           repository: ${{ inputs.gitops_repository }}
@@ -201,13 +248,13 @@ jobs:
           fetch-depth: 1
 
       - name: Update GitOps application(s)
-        if: steps.plan.outputs.should_deploy == 'true' && inputs.gitops_repository != ''
+        if: steps.resolved_plan.outputs.should_deploy == 'true' && inputs.gitops_repository != ''
         id: update_gitops
         shell: bash
         env:
-          MULTI_PRODUCT: ${{ steps.plan.outputs.multi_product }}
-          PRODUCTS_PLAN: ${{ steps.plan.outputs.products_plan }}
-          HELM_SET_ARGS: ${{ steps.plan.outputs.helm_set_args }}
+          MULTI_PRODUCT: ${{ steps.resolved_plan.outputs.multi_product }}
+          PRODUCTS_PLAN: ${{ steps.resolved_plan.outputs.products_plan }}
+          HELM_SET_ARGS: ${{ steps.resolved_plan.outputs.helm_set_args }}
           APPLICATION_FILE: ${{ inputs.gitops_application_file }}
           HELM_RELEASE: ${{ inputs.helm_release }}
           GITOPS_UPDATE_TARGET_REVISION_DEFAULT: ${{ inputs.gitops_update_target_revision }}
@@ -261,6 +308,7 @@ jobs:
           target_revision = os.environ.get("GITOPS_TARGET_REVISION", "").strip()
           changed_files = []
           release_names = []
+          webhook_targets = []
 
           if multi:
               products = json.loads(os.environ.get("PRODUCTS_PLAN") or "[]")
@@ -288,6 +336,9 @@ jobs:
                   apply_updates(path, updates, update_tr, target_revision)
                   changed_files.append(app_file)
                   release_names.append(product.get("helm_release") or product.get("name") or app_file)
+                  webhook_target = product.get("gitops_webhook_target")
+                  if webhook_target:
+                      webhook_targets.append(webhook_target)
           else:
               app_file = os.environ.get("APPLICATION_FILE") or ""
               helm_set = os.environ.get("HELM_SET_ARGS") or ""
@@ -309,6 +360,7 @@ jobs:
 
           Path("/tmp/gitops-files.txt").write_text("\n".join(changed_files) + "\n")
           Path("/tmp/gitops-releases.txt").write_text(", ".join(release_names))
+          Path("/tmp/gitops-webhook-targets.txt").write_text("\n".join(dict.fromkeys(webhook_targets)) + "\n")
           print("Updated:", ", ".join(changed_files))
           PY
 
@@ -316,14 +368,17 @@ jobs:
           cat /tmp/gitops-files.txt >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
           echo "releases=$(cat /tmp/gitops-releases.txt)" >> "$GITHUB_OUTPUT"
+          echo "webhook_targets<<EOF" >> "$GITHUB_OUTPUT"
+          cat /tmp/gitops-webhook-targets.txt >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
 
       - name: Push GitOps update
         id: push_gitops_update
-        if: steps.plan.outputs.should_deploy == 'true' && inputs.gitops_repository != ''
+        if: steps.resolved_plan.outputs.should_deploy == 'true' && inputs.gitops_repository != ''
         working-directory: gitops
         shell: bash
         env:
-          MULTI_PRODUCT: ${{ steps.plan.outputs.multi_product }}
+          MULTI_PRODUCT: ${{ steps.resolved_plan.outputs.multi_product }}
           CHANGED_FILES: ${{ steps.update_gitops.outputs.files }}
           RELEASES: ${{ steps.update_gitops.outputs.releases }}
         run: |
@@ -359,19 +414,14 @@ jobs:
           exit 1
 
       - name: Trigger Argo CD webhook
-        if: steps.plan.outputs.should_deploy == 'true' && inputs.gitops_repository != '' && steps.push_gitops_update.outputs.changed == 'true'
+        if: steps.resolved_plan.outputs.should_deploy == 'true' && inputs.gitops_repository != '' && steps.push_gitops_update.outputs.changed == 'true'
         working-directory: gitops
         shell: bash
         env:
           GITOPS_WEBHOOK_SECRET: ${{ secrets.gitops_webhook_secret }}
+          WEBHOOK_TARGETS: ${{ steps.update_gitops.outputs.webhook_targets }}
         run: |
           set -euo pipefail
-          if [ -z "$GITOPS_WEBHOOK_URL" ]; then
-            echo "gitops_webhook_url is not set; skipping Argo CD webhook trigger."
-            exit 0
-          fi
-
-          webhook_url="${GITOPS_WEBHOOK_URL%/}/api/webhook"
           payload_file="$(mktemp)"
           signature_file="$(mktemp)"
           commit_sha="$(git rev-parse HEAD)"
@@ -407,4 +457,31 @@ jobs:
             headers+=(-H "X-Hub-Signature-256: $(cat "$signature_file")")
           fi
 
-          curl -fsSL -X POST "${headers[@]}" --data-binary "@$payload_file" "$webhook_url"
+          webhook_urls=()
+          if [ "$GITOPS_WEBHOOK_URLS_JSON" != "" ] && [ "$GITOPS_WEBHOOK_URLS_JSON" != "{}" ]; then
+            jq -e 'type == "object"' <<< "$GITOPS_WEBHOOK_URLS_JSON" >/dev/null
+            while IFS= read -r target; do
+              [ -z "$target" ] && continue
+              url="$(jq -r --arg target "$target" '.[$target] // empty' <<< "$GITOPS_WEBHOOK_URLS_JSON")"
+              if [ -z "$url" ]; then
+                echo "No Argo CD webhook URL is configured for target: $target" >&2
+                exit 1
+              fi
+              webhook_urls+=("$url")
+            done <<< "$WEBHOOK_TARGETS"
+          fi
+
+          if [ "${#webhook_urls[@]}" -eq 0 ] && [ -n "$GITOPS_WEBHOOK_URL" ]; then
+            webhook_urls+=("$GITOPS_WEBHOOK_URL")
+          fi
+          if [ "${#webhook_urls[@]}" -eq 0 ]; then
+            echo "No Argo CD webhook target is configured; skipping trigger."
+            exit 0
+          fi
+
+          while IFS= read -r webhook_url; do
+            [ -z "$webhook_url" ] && continue
+            webhook_url="${webhook_url%/}/api/webhook"
+            echo "Triggering Argo CD webhook: $webhook_url"
+            curl -fsSL -X POST "${headers[@]}" --data-binary "@$payload_file" "$webhook_url"
+          done < <(printf '%s\n' "${webhook_urls[@]}" | sort -u)
