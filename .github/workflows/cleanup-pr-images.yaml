@@ -18,21 +18,42 @@ on:
         required: true
         default: 7
         type: number
+      execute:
+        description: "Execute stage 2 deletion after the dry-run plan"
+        required: true
+        default: false
+        type: boolean
       require_approval:
         description: "Require delete environment approval"
+        required: true
+        default: true
+        type: boolean
+      pr_repository:
+        description: "Repository that owns the PR numbers in image tags (owner/repository; blank = this repository)"
+        required: false
+        default: ""
+        type: string
+      protect_open_prs:
+        description: "Protect artifacts whose source PR is still open"
         required: true
         default: true
         type: boolean
 
 permissions:
   contents: read
+  pull-requests: read
   packages: write
+
+concurrency:
+  group: ghcr-image-cleanup-${{ github.repository }}
+  cancel-in-progress: false
 
 jobs:
   plan:
     runs-on: workflows-runner-set
     permissions:
       contents: read
+      pull-requests: read
       packages: write
     outputs:
       candidate_count: ${{ steps.plan.outputs.candidate_count }}
@@ -52,6 +73,9 @@ jobs:
           IMAGE_NAME: ${{ inputs.image_name }}
           PR_NUMBERS: ${{ inputs.pr_numbers }}
           OLDER_THAN_DAYS: ${{ inputs.older_than_days }}
+          PR_REPOSITORY: ${{ inputs.pr_repository }}
+          PROTECT_OPEN_PRS: ${{ inputs.protect_open_prs }}
+          PR_READ_TOKEN: ${{ secrets.MICROMARKETING_PR_READ_TOKEN }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -64,14 +88,16 @@ jobs:
           name: delete-plan
           path: delete-plan.json
           if-no-files-found: error
+          retention-days: 30
 
   delete:
     needs: plan
-    if: needs.plan.result == 'success' && needs.plan.outputs.candidate_count != '0' && fromJSON(format('{0}', inputs.require_approval))
+    if: needs.plan.result == 'success' && needs.plan.outputs.candidate_count != '0' && inputs.execute && inputs.require_approval
     runs-on: workflows-runner-set
     environment: delete
     permissions:
       contents: read
+      pull-requests: read
       packages: write
     steps:
       - name: Checkout repository
@@ -92,6 +118,7 @@ jobs:
         uses: actions/github-script@v7
         env:
           DELETE_MODE: "stage 2"
+          PR_READ_TOKEN: ${{ secrets.MICROMARKETING_PR_READ_TOKEN }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -100,10 +127,11 @@ jobs:
 
   delete-no-approval:
     needs: plan
-    if: needs.plan.result == 'success' && needs.plan.outputs.candidate_count != '0' && !fromJSON(format('{0}', inputs.require_approval))
+    if: needs.plan.result == 'success' && needs.plan.outputs.candidate_count != '0' && inputs.execute && !inputs.require_approval
     runs-on: workflows-runner-set
     permissions:
       contents: read
+      pull-requests: read
       packages: write
     steps:
       - name: Checkout repository
@@ -124,6 +152,7 @@ jobs:
         uses: actions/github-script@v7
         env:
           DELETE_MODE: "stage 2, no approval"
+          PR_READ_TOKEN: ${{ secrets.MICROMARKETING_PR_READ_TOKEN }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
