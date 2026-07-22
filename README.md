@@ -36,9 +36,9 @@ To create a release:
 
   For pull request builds, image tags are suffixed as `${version}-pr${number}-${sha}` and the `latest` tag is not updated.
 
-- `.github/workflows/cleanup-pr-images.yaml` – Manually triggered workflow that removes PR-tagged GHCR container versions, PR-specific build caches, and untagged GHCR versions. It supports deleting all PR artifacts for a package or only specific PR numbers, with a `dry-run` preview mode.
+- `.github/workflows/cleanup-pr-images.yaml` – Manually triggered workflow that plans removal of stale PR-tagged GHCR versions, PR-specific build caches, and untagged versions. Manual runs are preview-only unless deletion is explicitly enabled.
 
-- `.github/workflows/cleanup-pr-images-weekly.yaml` – Weekly scheduler that dispatches the cleanup workflow with fixed inputs for micromarketing images and no approval gate.
+- `.github/workflows/cleanup-pr-images-weekly.yaml` – Weekly scheduler that reads Micromarketing's CI image catalog, includes the shared build cache package, and performs the approved automatic cleanup.
 
 - `.github/workflows/release.yaml` – Manages version bumps and publishes releases for this repository's reusable workflows.
 
@@ -86,24 +86,41 @@ Use *Actions -> Cleanup GHCR Images* to clean up PR images, PR-specific registry
 - default image when blank: `ghcr.io/JWilson45/<repo>`
 - `pr_numbers` (optional): comma-separated PR numbers, for example `123,456`; leave blank to target all PR-tagged versions
 - `older_than_days` (default `7`): only delete candidate versions older than this many days
-- `require_approval` (default `true`): when true, stage 2 uses environment `delete`
+- `execute` (default `false`): set to true to run stage 2 deletion; manual dispatches otherwise stop after the uploaded plan
+- `require_approval` (default `true`): when executing, use environment `delete` for approval
+- `pr_repository` (optional): repository that owns PR numbers in image tags; blank uses this repository
+- `protect_open_prs` (default `true`): do not delete artifacts for source PRs that remain open
 - note: IDs like `652340938` in logs are GHCR package version IDs (not PR numbers)
 - permissions: delete requires package admin access for the token on the target package
 - deletes versions whose tags are all PR image tags like `1.2.3-pr123-abcdef0`
 - deletes versions whose tags are all PR cache tags like `buildcache-api-pr123`
+- deletes shared dependency-cache versions tagged `deps-pr123`
 - deletes untagged versions older than the cutoff
 - protects versions with any non-PR tag, including `latest`, release/version tags, and shared baseline cache tags like `buildcache-api`
+- protects old PR-tagged versions when the associated source PR is still open
 - stage 1 builds a dry-run delete plan and uploads `delete-plan` artifact
-- manual stage 2 runs in environment `delete` (approval gate)
+- stage 2 re-fetches every candidate before deleting, so changed tags, reopened PRs, and stale plans are skipped safely
+- cleanup runs are serialized and delete-plan artifacts are retained for 30 days
+- manual stage 2 runs in environment `delete` (approval gate) when `execute=true`
 - implementation files:
   `.github/scripts/ghcr-cleanup/plan.js`,
   `.github/scripts/ghcr-cleanup/delete.js`
 
 ## Weekly scheduled cleanup
 
-`cleanup-pr-images-weekly.yaml` runs every Sunday at 16:20 UTC and dispatches `cleanup-pr-images.yaml` with:
+`cleanup-pr-images-weekly.yaml` runs every Sunday at 16:20 UTC. It reads
+`JWilson45/micromarketing`'s `.github/ci/catalog.json`, adds
+`ghcr.io/jwilson45/mm-buildcache`, and dispatches `cleanup-pr-images.yaml` with:
 
-- `image_name`: `ghcr.io/JWilson45/mmmodern-web,ghcr.io/JWilson45/mmmodern-api,ghcr.io/JWilson45/mm`
+- `image_name`: every current CI image in the catalog plus the shared build cache (the Outlook MCP POC is not in this catalog)
 - `pr_numbers`: blank (all PR-tagged versions)
 - `older_than_days`: `7`
+- `pr_repository`: `JWilson45/micromarketing`
+- `protect_open_prs`: `true`
+- `execute`: `true` on schedule; a manual run of the weekly wrapper defaults to preview-only
 - `require_approval`: `false`
+
+The public `workflows` repository needs a `MICROMARKETING_PR_READ_TOKEN` secret:
+a fine-grained token limited to `JWilson45/micromarketing` with **Contents: Read**
+and **Pull requests: Read**. It is used only to read the private CI catalog and
+PR state; package listing and deletion continue to use the workflow token.

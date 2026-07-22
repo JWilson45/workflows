@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: "20 16 * * 0"
   workflow_dispatch:
+    inputs:
+      execute:
+        description: "Execute deletion (manual runs default to preview only)"
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -13,25 +19,65 @@ jobs:
   dispatch-cleanup:
     runs-on: workflows-runner-set
     steps:
+      - name: Verify Micromarketing read token
+        env:
+          MICROMARKETING_PR_READ_TOKEN: ${{ secrets.MICROMARKETING_PR_READ_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$MICROMARKETING_PR_READ_TOKEN" || {
+            echo "MICROMARKETING_PR_READ_TOKEN is required to read the private CI catalog and protect open PR artifacts." >&2
+            exit 1
+          }
+
+      - name: Checkout Micromarketing CI catalog
+        uses: actions/checkout@v6
+        with:
+          repository: JWilson45/micromarketing
+          token: ${{ secrets.MICROMARKETING_PR_READ_TOKEN }}
+          path: micromarketing
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: |
+            .github/ci/catalog.json
+
       - name: Dispatch cleanup workflow with weekly inputs
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
+            const fs = require("fs");
             const dispatchRef =
               context.payload?.repository?.default_branch ||
               process.env.GITHUB_REF_NAME ||
               "main";
+            const catalogPath = `${process.env.GITHUB_WORKSPACE}/micromarketing/.github/ci/catalog.json`;
+            const catalog = JSON.parse(fs.readFileSync(catalogPath, "utf8"));
+            const imageNames = Object.values(catalog.images || {})
+              .map((image) => String(image.image || "").trim())
+              .filter(Boolean);
+            imageNames.push("ghcr.io/jwilson45/mm-buildcache");
+            const uniqueImageNames = [...new Set(imageNames)].sort();
+            if (uniqueImageNames.length === 0 || uniqueImageNames.some((image) => !image.startsWith("ghcr.io/"))) {
+              throw new Error("Micromarketing CI catalog must contain one or more GHCR image references.");
+            }
+            const scheduled = context.eventName === "schedule";
+            const execute = scheduled
+              ? "true"
+              : String(context.payload.inputs?.execute || "false").toLowerCase() === "true" ? "true" : "false";
             await github.rest.actions.createWorkflowDispatch({
               owner: context.repo.owner,
               repo: context.repo.repo,
               workflow_id: "cleanup-pr-images.yaml",
               ref: dispatchRef,
               inputs: {
-                image_name: "ghcr.io/JWilson45/mmmodern-web,ghcr.io/JWilson45/mmmodern-api,ghcr.io/JWilson45/mm",
+                image_name: uniqueImageNames.join(","),
                 pr_numbers: "",
                 older_than_days: "7",
-                require_approval: "false",
+                execute,
+                require_approval: scheduled ? "false" : "true",
+                pr_repository: "JWilson45/micromarketing",
+                protect_open_prs: "true",
               },
             });
-            core.info(`Dispatched cleanup-pr-images.yaml on ref ${dispatchRef} with weekly inputs.`);
+            core.info(`Dispatched cleanup-pr-images.yaml on ref ${dispatchRef}; execute=${execute}; images=${uniqueImageNames.join(", ")}`);
