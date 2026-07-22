@@ -6,6 +6,7 @@ const {
   extractPrFromTag,
 } = require("./common");
 const { getCurrentVersion } = require("./delete");
+const { listPackageVersions } = require("./plan");
 
 const oldVersion = (tags) => ({
   id: 1,
@@ -88,4 +89,19 @@ test("treats a disappeared package version as a revalidation skip", async () => 
   };
   const result = await getCurrentVersion(github, { owner: "JWilson45", packageName: "mm", scope: "user" }, 123);
   assert.equal(result, null);
+});
+
+test("treats a package that has not been built yet as empty rather than an error", async () => {
+  const missing = Object.assign(new Error("Package not found"), { status: 404 });
+  const github = {
+    paginate: async () => { throw missing; },
+    rest: {
+      packages: {
+        getAllPackageVersionsForPackageOwnedByOrg: {},
+        getAllPackageVersionsForPackageOwnedByUser: {},
+      },
+    },
+  };
+  const result = await listPackageVersions(github, "JWilson45", "mm-buildcache");
+  assert.deepEqual(result, { versions: [], scope: null, missing: true });
 });

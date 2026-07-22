@@ -65,13 +65,20 @@ async function listPackageVersions(github, owner, packageName) {
     if (error.status !== 404 && error.status !== 422) throw error;
   }
 
-  const versions = await github.paginate(github.rest.packages.getAllPackageVersionsForPackageOwnedByUser, {
-    username: owner,
-    package_type: "container",
-    package_name: packageName,
-    per_page: 100,
-  });
-  return { versions, scope: "user" };
+  try {
+    const versions = await github.paginate(github.rest.packages.getAllPackageVersionsForPackageOwnedByUser, {
+      username: owner,
+      package_type: "container",
+      package_name: packageName,
+      per_page: 100,
+    });
+    return { versions, scope: "user", missing: false };
+  } catch (error) {
+    if (error.status === 404 || error.status === 422) {
+      return { versions: [], scope: null, missing: true };
+    }
+    throw error;
+  }
 }
 
 module.exports = async function runPlan({ github, context, core, process }) {
@@ -112,7 +119,32 @@ module.exports = async function runPlan({ github, context, core, process }) {
     let packageName;
     try {
       ({ owner, packageName } = parseImageName(imageName));
-      const { versions, scope } = await listPackageVersions(github, owner, packageName);
+      const { versions, scope, missing } = await listPackageVersions(github, owner, packageName);
+      if (missing) {
+        deletePlan.images.push({
+          image: `${owner}/${packageName}`,
+          owner,
+          packageName,
+          scope: null,
+          versions: [],
+        });
+        results.push({
+          image: `${owner}/${packageName}`,
+          versionsScanned: 0,
+          candidates: 0,
+          prTaggedCandidates: 0,
+          untaggedCandidates: 0,
+          protectedMixed: 0,
+          protectedOpenPr: 0,
+          skippedBySelection: 0,
+          skippedByAge: 0,
+          skippedNoTimestamp: 0,
+          skippedNonCleanupTags: 0,
+          missing: true,
+          error: null,
+        });
+        continue;
+      }
       const candidates = [];
       const stats = {
         protectedMixed: 0,
@@ -160,6 +192,7 @@ module.exports = async function runPlan({ github, context, core, process }) {
         prTaggedCandidates: candidates.filter((candidate) => candidate.reason === "pr-tagged").length,
         untaggedCandidates: candidates.filter((candidate) => candidate.reason === "untagged").length,
         ...stats,
+        missing: false,
         error: null,
       });
     } catch (error) {
@@ -175,6 +208,7 @@ module.exports = async function runPlan({ github, context, core, process }) {
         skippedByAge: 0,
         skippedNoTimestamp: 0,
         skippedNonCleanupTags: 0,
+        missing: false,
         error: error.message,
       });
       core.warning(`[${imageName}] ${error.message}`);
@@ -199,6 +233,7 @@ module.exports = async function runPlan({ github, context, core, process }) {
     core.summary
       .addRaw(`### ${result.image}\n`)
       .addRaw(`Versions scanned: \`${result.versionsScanned}\`\n`)
+      .addRaw(`Package not created yet: \`${result.missing || false}\`\n`)
       .addRaw(`Candidates: \`${result.candidates}\`\n`)
       .addRaw(`Candidate PR/cache-tagged versions: \`${result.prTaggedCandidates}\`\n`)
       .addRaw(`Candidate untagged versions: \`${result.untaggedCandidates}\`\n`)
@@ -220,3 +255,4 @@ module.exports = async function runPlan({ github, context, core, process }) {
 
 module.exports.parseImageName = parseImageName;
 module.exports.parseSelectedPrs = parseSelectedPrs;
+module.exports.listPackageVersions = listPackageVersions;
