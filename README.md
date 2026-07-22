@@ -23,7 +23,7 @@ To create a release:
 - `.github/workflows/build-images.yaml` – **Single job (Bake):** plan tags + `docker buildx bake` for one or more images. Prefer this for monorepo CI build stages.
   - Defaults to `linux/amd64`
   - Inputs `attest_mode` (`min`|`max`|`none`) and `registry_cache_mode` (`min`|`max`)
-  - Local BuildKit cache via `buildx_cache_dir` (default `/var/cache/buildx`)
+  - **Registry cache only** (no local/type=local cache — ephemeral runners discard disk after the job)
   - Bake runs with `--progress=plain` for per-stage timings in logs
 
 - `.github/workflows/deploy-products.yaml` – **Single job (Ship):** plan tags + Helm and/or atomic multi-product GitOps. Prefer this for monorepo CI deploy stages gated on tests.
