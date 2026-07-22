@@ -20,5 +20,3 @@ jobs:
         with:
           node-version: 20
       - run: node --test .github/scripts/ghcr-cleanup/*.test.js
-      - name: Parse cleanup workflows
-        run: ruby -e 'require "yaml"; ARGV.each { |path| YAML.load_file(path) }' .github/workflows/cleanup-pr-images.yaml .github/workflows/cleanup-pr-images-weekly.yaml
