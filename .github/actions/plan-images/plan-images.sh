@@ -40,6 +40,7 @@ if [ -z "$cache_pr_number" ] && [ "${GITHUB_EVENT_NAME}" = "push" ]; then
 fi
 short_sha="$(echo "$GITHUB_SHA" | cut -c1-7)"
 build_matrix='[]'
+image_plan='[]'
 image_meta='{}'
 helm_set_args=''
 
@@ -178,7 +179,9 @@ while IFS= read -r image_config; do
   fi
   cache_to="$(printf '%s\n' "${cache_to_lines[@]}")"
 
+  image_action="reuse"
   if ! check_tag "$image" "$image_tag"; then
+    image_action="build"
     matrix_item="$(jq -cn \
       --arg name "$name" \
       --arg image "$image" \
@@ -192,6 +195,16 @@ while IFS= read -r image_config; do
       '{name:$name,image:$image,registry:$registry,dockerTarget:$dockerTarget,dockerContext:$dockerContext,dockerfile:$dockerfile,tags:$tags,cacheFrom:$cacheFrom,cacheTo:$cacheTo}')"
     build_matrix="$(jq -c --argjson item "$matrix_item" '. + [$item]' <<< "$build_matrix")"
   fi
+
+  plan_item="$(jq -cn \
+    --arg name "$name" \
+    --arg image "$image" \
+    --arg tag "$image_tag" \
+    --arg action "$image_action" \
+    --arg tags "$tags" \
+    --arg helmTagPath "$helm_tag_path" \
+    '{name:$name,image:$image,tag:$tag,action:$action,tags:$tags,helmTagPath:$helmTagPath}')"
+  image_plan="$(jq -c --argjson item "$plan_item" '. + [$item]' <<< "$image_plan")"
 
   image_meta="$(jq -c \
     --arg name "$name" \
@@ -284,7 +297,55 @@ echo "multi_product=$multi_product"
 echo "should_build=$should_build"
 echo "should_deploy=$should_deploy"
 echo "images to build: $(jq -c '[.[].name]' <<< "$build_matrix")"
+echo "image plan: $(jq -c '[.[] | {name,tag,action}]' <<< "$image_plan")"
 echo "products to deploy: $(jq -c '[.[].name]' <<< "$products_plan")"
+
+if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+  {
+    echo "## Image plan"
+    echo ""
+    echo "| Image | Registry ref | Tag | Action |"
+    echo "|-------|--------------|-----|--------|"
+    while IFS= read -r row; do
+      [ -z "$row" ] && continue
+      n="$(jq -r '.name' <<< "$row")"
+      img="$(jq -r '.image' <<< "$row")"
+      tag="$(jq -r '.tag' <<< "$row")"
+      action="$(jq -r '.action' <<< "$row")"
+      echo "| \`$n\` | \`$img\` | \`$tag\` | $action |"
+    done < <(jq -c '.[]' <<< "$image_plan")
+    echo ""
+    echo "- **should_build:** \`$should_build\`"
+    echo "- **should_deploy:** \`$should_deploy\`"
+    echo "- **multi_product:** \`$multi_product\`"
+    echo ""
+
+    if [ "$multi_product" = "true" ]; then
+      echo "## Deploy plan"
+      echo ""
+      if [ "$(jq 'length' <<< "$products_plan")" -eq 0 ]; then
+        echo "_No products scheduled for deploy._"
+      else
+        echo "| Product | Release | Namespace | Helm set args |"
+        echo "|---------|---------|-----------|---------------|"
+        while IFS= read -r product; do
+          [ -z "$product" ] && continue
+          pname="$(jq -r '.name // empty' <<< "$product")"
+          prelease="$(jq -r '.helm_release // empty' <<< "$product")"
+          pns="$(jq -r '.kube_namespace // empty' <<< "$product")"
+          pset="$(jq -r '.helm_set_args // empty' <<< "$product")"
+          echo "| \`$pname\` | \`$prelease\` | \`$pns\` | \`$pset\` |"
+        done < <(jq -c '.[]' <<< "$products_plan")
+      fi
+      echo ""
+    elif [ -n "$helm_set_args" ]; then
+      echo "## Deploy plan (single product)"
+      echo ""
+      echo "- **helm_set_args:** \`$helm_set_args\`"
+      echo ""
+    fi
+  } >> "$GITHUB_STEP_SUMMARY"
+fi
 
 {
   echo "build_matrix=$build_matrix"
@@ -292,6 +353,9 @@ echo "products to deploy: $(jq -c '[.[].name]' <<< "$products_plan")"
   echo "multi_product=$multi_product"
   echo "should_build=$should_build"
   echo "should_deploy=$should_deploy"
+  echo "image_plan<<IMAGE_PLAN_EOF"
+  echo "$image_plan"
+  echo "IMAGE_PLAN_EOF"
   echo "products_plan<<PLAN_EOF"
   echo "$products_plan"
   echo "PLAN_EOF"

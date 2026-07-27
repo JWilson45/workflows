@@ -104,6 +104,9 @@ jobs:
           USE_PREPLANNED_PLAN: ${{ inputs.use_preplanned_plan }}
           PREPLANNED_BUILD_MATRIX: ${{ inputs.preplanned_build_matrix }}
           PLANNED_BUILD_MATRIX: ${{ steps.plan.outputs.build_matrix }}
+          PLATFORMS: ${{ inputs.platforms }}
+          ATTEST_MODE: ${{ inputs.attest_mode }}
+          REGISTRY_CACHE_MODE: ${{ inputs.registry_cache_mode }}
         run: |
           set -euo pipefail
           if [ "$USE_PREPLANNED_PLAN" = "true" ]; then
@@ -112,12 +115,47 @@ jobs:
             build_matrix="$PLANNED_BUILD_MATRIX"
           fi
           jq -e 'type == "array"' <<< "$build_matrix" >/dev/null
-          echo "build_matrix=$build_matrix" >> "$GITHUB_OUTPUT"
           if [ "$(jq 'length' <<< "$build_matrix")" -gt 0 ]; then
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            should_build=true
           else
-            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            should_build=false
           fi
+          {
+            echo "build_matrix<<BUILD_MATRIX_EOF"
+            printf '%s\n' "$build_matrix"
+            echo "BUILD_MATRIX_EOF"
+            echo "should_build=$should_build"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Bake plan"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| should_build | \`$should_build\` |"
+            echo "| platforms | \`$PLATFORMS\` |"
+            echo "| attest_mode | \`$ATTEST_MODE\` |"
+            echo "| registry_cache_mode | \`$REGISTRY_CACHE_MODE\` |"
+            echo "| image count | $(jq 'length' <<< "$build_matrix") |"
+            echo ""
+            if [ "$should_build" = "true" ]; then
+              echo "### Images to build"
+              echo ""
+              echo "| Name | Image | Tags | Target |"
+              echo "|------|-------|------|--------|"
+              while IFS= read -r item; do
+                [ -z "$item" ] && continue
+                n="$(jq -r '.name' <<< "$item")"
+                img="$(jq -r '.image' <<< "$item")"
+                tags="$(jq -r '.tags | gsub("\n"; "<br>")' <<< "$item")"
+                target="$(jq -r '.dockerTarget' <<< "$item")"
+                echo "| \`$n\` | \`$img\` | $tags | \`$target\` |"
+              done < <(jq -c '.[]' <<< "$build_matrix")
+            else
+              echo "_No images to build (all planned tags already exist, or empty matrix)._"
+            fi
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up Docker Buildx
         if: steps.resolved_plan.outputs.should_build == 'true'
@@ -249,3 +287,18 @@ jobs:
 
           echo "Building with docker buildx bake (progress=plain for stage timings)..."
           docker buildx bake --progress=plain -f "$bake_file"
+
+          {
+            echo "### Bake result"
+            echo ""
+            echo "Successfully baked **$image_count** image(s) with \`attest=$ATTEST_MODE\` and \`registry_cache=$REGISTRY_CACHE_MODE\`."
+            echo ""
+            echo "<details><summary>Bake targets</summary>"
+            echo ""
+            echo '```json'
+            jq -c '[.[] | {name, image, tags}]' <<< "$BUILD_MATRIX"
+            echo '```'
+            echo ""
+            echo "</details>"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -27,6 +27,9 @@ outputs:
   build_matrix:
     description: Images that need building
     value: ${{ steps.plan.outputs.build_matrix }}
+  image_plan:
+    description: Per-image status (name, tag, action build|reuse)
+    value: ${{ steps.plan.outputs.image_plan }}
   helm_set_args:
     description: Single-product helm set args
     value: ${{ steps.plan.outputs.helm_set_args }}

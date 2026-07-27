@@ -127,6 +127,7 @@ jobs:
           PLANNED_MULTI_PRODUCT: ${{ steps.plan.outputs.multi_product }}
           PLANNED_HELM_SET_ARGS: ${{ steps.plan.outputs.helm_set_args }}
           PLANNED_SHOULD_DEPLOY: ${{ steps.plan.outputs.should_deploy }}
+          GITOPS_REPOSITORY: ${{ inputs.gitops_repository }}
         run: |
           set -euo pipefail
           if [ "$USE_PREPLANNED_PLAN" = "true" ]; then
@@ -145,15 +146,61 @@ jobs:
             should_deploy="$PLANNED_SHOULD_DEPLOY"
             helm_set_args="$PLANNED_HELM_SET_ARGS"
           fi
-          echo "products_plan=$products_plan" >> "$GITHUB_OUTPUT"
-          echo "multi_product=$multi_product" >> "$GITHUB_OUTPUT"
-          echo "should_deploy=$should_deploy" >> "$GITHUB_OUTPUT"
-          echo "helm_set_args=$helm_set_args" >> "$GITHUB_OUTPUT"
+          {
+            echo "products_plan<<PRODUCTS_PLAN_EOF"
+            printf '%s\n' "$products_plan"
+            echo "PRODUCTS_PLAN_EOF"
+            echo "multi_product=$multi_product"
+            echo "should_deploy=$should_deploy"
+            echo "helm_set_args=$helm_set_args"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Ship plan"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| should_deploy | \`$should_deploy\` |"
+            echo "| multi_product | \`$multi_product\` |"
+            echo "| gitops_repository | \`${GITOPS_REPOSITORY:-_(none)_}\` |"
+            echo ""
+            if [ "$should_deploy" != "true" ]; then
+              echo "_Nothing to ship._"
+            elif [ "$multi_product" = "true" ]; then
+              echo "### Products"
+              echo ""
+              echo "| Product | Release | Namespace | Chart | Values | Helm set args | GitOps app |"
+              echo "|---------|---------|-----------|-------|--------|---------------|------------|"
+              while IFS= read -r product; do
+                [ -z "$product" ] && continue
+                pname="$(jq -r '.name // empty' <<< "$product")"
+                prelease="$(jq -r '.helm_release // empty' <<< "$product")"
+                pns="$(jq -r '.kube_namespace // empty' <<< "$product")"
+                pchart="$(jq -r '.helm_chart // empty' <<< "$product")"
+                pvalues="$(jq -r '.helm_values_file // empty' <<< "$product")"
+                pset="$(jq -r '.helm_set_args // empty' <<< "$product")"
+                papp="$(jq -r '.gitops_application_file // empty' <<< "$product")"
+                echo "| \`$pname\` | \`$prelease\` | \`$pns\` | \`$pchart\` | \`$pvalues\` | \`$pset\` | \`$papp\` |"
+              done < <(jq -c '.[]' <<< "$products_plan")
+            else
+              echo "### Single product"
+              echo ""
+              echo "- **helm_set_args:** \`$helm_set_args\`"
+            fi
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Skip ship when plan says no deploy
         if: steps.resolved_plan.outputs.should_deploy != 'true'
         shell: bash
-        run: echo "should_deploy=false; nothing to ship."
+        run: |
+          echo "should_deploy=false; nothing to ship."
+          {
+            echo "### Ship result"
+            echo ""
+            echo "Skipped — plan said \`should_deploy=false\`."
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Plan Helm deploy mode
         id: helm_deploy
@@ -204,6 +251,7 @@ jobs:
           HELM_SET_ARGS: ${{ steps.resolved_plan.outputs.helm_set_args }}
         run: |
           set -euo pipefail
+          upgraded=()
           if [ "$MULTI_PRODUCT" = "true" ]; then
             while IFS= read -r product; do
               release="$(jq -r '.helm_release' <<< "$product")"
@@ -223,6 +271,7 @@ jobs:
                 --wait \
                 --timeout "$timeout" \
                 --history-max 5
+              upgraded+=("$release ($namespace)")
             done < <(jq -c '.[]' <<< "$PRODUCTS_PLAN")
           else
             helm upgrade --install \
@@ -235,7 +284,18 @@ jobs:
               --wait \
               --timeout "${{ inputs.helm_timeout }}" \
               --history-max 5
+            upgraded+=("${{ inputs.helm_release }} (${{ inputs.kube_namespace }})")
           fi
+          {
+            echo "### Helm result"
+            echo ""
+            echo "Upgraded **${#upgraded[@]}** release(s):"
+            echo ""
+            for r in "${upgraded[@]}"; do
+              echo "- \`$r\`"
+            done
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Checkout GitOps repo
         if: steps.resolved_plan.outputs.should_deploy == 'true' && inputs.gitops_repository != ''
@@ -386,6 +446,20 @@ jobs:
           if git diff --quiet; then
             echo "No GitOps changes to commit."
             echo "changed=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### GitOps result"
+              echo ""
+              echo "No file changes after applying planned tags (Application manifests already match)."
+              echo ""
+              echo "- **releases:** $RELEASES"
+              echo "- **files considered:**"
+              echo ""
+              while IFS= read -r f; do
+                [ -z "$f" ] && continue
+                echo "  - \`$f\`"
+              done <<< "$CHANGED_FILES"
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           git config user.name "github-actions[bot]"
@@ -405,6 +479,22 @@ jobs:
             git rebase "origin/${{ inputs.gitops_branch }}"
             if git push origin HEAD:${{ inputs.gitops_branch }}; then
               echo "changed=true" >> "$GITHUB_OUTPUT"
+              commit_sha="$(git rev-parse HEAD)"
+              {
+                echo "### GitOps result"
+                echo ""
+                echo "Pushed commit \`$commit_sha\` to \`${{ inputs.gitops_repository }}\` (\`${{ inputs.gitops_branch }}\`)."
+                echo ""
+                echo "- **message:** $msg"
+                echo "- **releases:** $RELEASES"
+                echo "- **files:**"
+                echo ""
+                while IFS= read -r f; do
+                  [ -z "$f" ] && continue
+                  echo "  - \`$f\`"
+                done <<< "$CHANGED_FILES"
+                echo ""
+              } >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
             echo "GitOps push attempt $attempt failed; retrying after rebase." >&2
@@ -458,6 +548,7 @@ jobs:
           fi
 
           webhook_urls=()
+          webhook_target_names=()
           if [ "$GITOPS_WEBHOOK_URLS_JSON" != "" ] && [ "$GITOPS_WEBHOOK_URLS_JSON" != "{}" ]; then
             jq -e 'type == "object"' <<< "$GITOPS_WEBHOOK_URLS_JSON" >/dev/null
             while IFS= read -r target; do
@@ -468,20 +559,46 @@ jobs:
                 exit 1
               fi
               webhook_urls+=("$url")
+              webhook_target_names+=("$target")
             done <<< "$WEBHOOK_TARGETS"
           fi
 
           if [ "${#webhook_urls[@]}" -eq 0 ] && [ -n "$GITOPS_WEBHOOK_URL" ]; then
             webhook_urls+=("$GITOPS_WEBHOOK_URL")
+            webhook_target_names+=("default")
           fi
           if [ "${#webhook_urls[@]}" -eq 0 ]; then
             echo "No Argo CD webhook target is configured; skipping trigger."
+            {
+              echo "### Argo CD webhooks"
+              echo ""
+              echo "No webhook target configured; skipped."
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
+          triggered=()
           while IFS= read -r webhook_url; do
             [ -z "$webhook_url" ] && continue
             webhook_url="${webhook_url%/}/api/webhook"
             echo "Triggering Argo CD webhook: $webhook_url"
             curl -fsSL -X POST "${headers[@]}" --data-binary "@$payload_file" "$webhook_url"
+            triggered+=("$webhook_url")
           done < <(printf '%s\n' "${webhook_urls[@]}" | sort -u)
+
+          {
+            echo "### Argo CD webhooks"
+            echo ""
+            echo "Triggered **${#triggered[@]}** webhook endpoint(s):"
+            echo ""
+            if [ "${#webhook_target_names[@]}" -gt 0 ]; then
+              for t in "${webhook_target_names[@]}"; do
+                echo "- target: \`$t\`"
+              done
+            fi
+            for u in "${triggered[@]}"; do
+              echo "- \`$u\`"
+            done
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
