@@ -39,7 +39,7 @@ jobs:
           sparse-checkout: |
             .github/scripts/ghcr-cleanup
 
-      - name: Checkout Micromarketing CI catalog
+      - name: Checkout Micromarketing
         uses: actions/checkout@v6
         with:
           repository: JWilson45/micromarketing
@@ -47,8 +47,6 @@ jobs:
           path: micromarketing
           fetch-depth: 1
           persist-credentials: false
-          sparse-checkout: |
-            .github/ci/catalog.json
 
       - name: Discover packages and dispatch cleanup
         uses: actions/github-script@v7
@@ -66,27 +64,31 @@ jobs:
               context.payload?.repository?.default_branch ||
               process.env.GITHUB_REF_NAME ||
               "main";
-            const catalogPath = `${process.env.GITHUB_WORKSPACE}/micromarketing/.github/ci/catalog.json`;
+            const micromarketingRoot = `${process.env.GITHUB_WORKSPACE}/micromarketing`;
+            const catalogPath = `${micromarketingRoot}/.github/ci/catalog.json`;
             const catalog = JSON.parse(fs.readFileSync(catalogPath, "utf8"));
             const catalogImages = readCatalogImages(catalog);
-            const imageNames = await discoverMicromarketingImages({ github });
+            const imageNames = await discoverMicromarketingImages({
+              github,
+              sourceRoot: micromarketingRoot,
+            });
             const drift = diffCatalog(imageNames, catalogImages);
             const rows = coverageRows(imageNames, catalogImages);
 
             await core.summary
               .addHeading("Weekly GHCR cleanup targets")
-              .addRaw("Source: container packages linked to `JWilson45/micromarketing`.\n")
+              .addRaw("Source: `ghcr.io/jwilson45/*` references in `JWilson45/micromarketing`, plus `mm-buildcache`.\n")
               .addRaw("The CI catalog is a coverage check, not the allowlist.\n\n")
               .addTable([
                 [
                   { data: "Package", header: true },
-                  { data: "In GHCR", header: true },
+                  { data: "Discovered", header: true },
                   { data: "In catalog", header: true },
                   { data: "Action", header: true },
                 ],
                 ...rows.map((row) => [
                   row.image,
-                  row.inGhcr ? "yes" : "no",
+                  row.inDiscovered ? "yes" : "no",
                   row.inCatalog ? "yes" : "no",
                   row.action,
                 ]),
