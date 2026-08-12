@@ -38,7 +38,7 @@ To create a release:
 
 - `.github/workflows/cleanup-pr-images.yaml` – Manually triggered workflow that plans removal of stale PR-tagged GHCR versions, PR-specific build caches, and untagged versions. Manual runs are preview-only unless deletion is explicitly enabled.
 
-- `.github/workflows/cleanup-pr-images-weekly.yaml` – Weekly scheduler that discovers every GHCR package linked to `JWilson45/micromarketing` (including Outlook MCP and packages not in the CI catalog), reports catalog drift, and performs the approved automatic cleanup.
+- `.github/workflows/cleanup-pr-images-weekly.yaml` – Weekly scheduler that discovers every `ghcr.io/jwilson45/*` image referenced in Micromarketing (including Outlook MCP and packages not in the CI catalog), reports catalog drift, and performs the approved automatic cleanup.
 
 - `.github/workflows/release.yaml` – Manages version bumps and publishes releases for this repository's reusable workflows.
 
@@ -108,11 +108,11 @@ Use *Actions -> Cleanup GHCR Images* to clean up PR images, PR-specific registry
 
 ## Weekly scheduled cleanup
 
-`cleanup-pr-images-weekly.yaml` runs every Sunday at 16:20 UTC. It lists
-`JWilson45` container packages linked to `JWilson45/micromarketing` (Outlook
-MCP / `outlook-connector`, `mm-buildcache`, `mm-postgres-replication`, and
-every other micromarketing-built image) and dispatches
-`cleanup-pr-images.yaml` with:
+`cleanup-pr-images-weekly.yaml` runs every Sunday at 16:20 UTC. It scans
+`JWilson45/micromarketing` for `ghcr.io/jwilson45/*` image references (Outlook
+MCP / `outlook-connector`, `mm-postgres-replication`, catalog images, and
+every other micromarketing-built image), always includes `mm-buildcache`, and
+dispatches `cleanup-pr-images.yaml` with:
 
 - `image_name`: every discovered micromarketing-linked GHCR package
 - `pr_numbers`: blank (all PR-tagged versions)
@@ -127,8 +127,10 @@ report. Images in GHCR but not in the catalog are cleaned. Catalog images with
 no GHCR package are warned and skipped. Packages from other repositories
 (`github-runner`, `obx-conditions`) are not included.
 
-If listing user packages fails, the weekly job fails closed instead of falling
-back to the catalog list.
+`GITHUB_TOKEN` cannot list user packages (the Packages list API returns HTTP
+400 for GitHub App tokens). Discovery therefore uses the Micromarketing
+checkout. A GHCR package list is attempted and unioned when the token allows
+it; list failures are ignored when source discovery already found images.
 
 The public `workflows` repository needs a `MICROMARKETING_PR_READ_TOKEN` secret:
 a fine-grained token limited to `JWilson45/micromarketing` with **Contents: Read**

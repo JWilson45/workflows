@@ -1,10 +1,15 @@
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 const test = require("node:test");
 const {
   coverageRows,
   diffCatalog,
+  discoverFromSource,
   discoverMicromarketingImages,
   discoveredImageNames,
+  extractImageNames,
   filterMicromarketingPackages,
   parseExclude,
   readCatalogImages,
@@ -93,9 +98,48 @@ test("coverage rows mark catalog-only images as skipped", () => {
     ["ghcr.io/jwilson45/mm", "ghcr.io/jwilson45/future-app"]
   );
   assert.deepEqual(rows, [
-    { image: "ghcr.io/jwilson45/future-app", inGhcr: false, inCatalog: true, action: "skipped; warn" },
-    { image: "ghcr.io/jwilson45/mm", inGhcr: true, inCatalog: true, action: "will clean" },
-    { image: "ghcr.io/jwilson45/mm-postgres-replication", inGhcr: true, inCatalog: false, action: "will clean" },
+    { image: "ghcr.io/jwilson45/future-app", inGhcr: false, inDiscovered: false, inCatalog: true, action: "skipped; warn" },
+    { image: "ghcr.io/jwilson45/mm", inGhcr: true, inDiscovered: true, inCatalog: true, action: "will clean" },
+    { image: "ghcr.io/jwilson45/mm-postgres-replication", inGhcr: true, inDiscovered: true, inCatalog: false, action: "will clean" },
+  ]);
+});
+
+test("extractImageNames strips tags and interpolations", () => {
+  const text = [
+    "ghcr.io/jwilson45/mm-postgres-replication:latest",
+    "ghcr.io/jwilson45/outlook-connector:${TAG}",
+    "repository: ghcr.io/jwilson45/mm",
+    "ghcr.io/someone-else/ignored",
+  ].join("\n");
+  assert.deepEqual(extractImageNames(text).sort(), [
+    "ghcr.io/jwilson45/mm",
+    "ghcr.io/jwilson45/mm-postgres-replication",
+    "ghcr.io/jwilson45/outlook-connector",
+  ]);
+});
+
+test("source scan finds micromarketing images and always includes the build cache", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ghcr-discover-"));
+  fs.mkdirSync(path.join(root, ".github", "ci"), { recursive: true });
+  fs.writeFileSync(
+    path.join(root, ".github", "ci", "catalog.json"),
+    JSON.stringify({ images: { mm: { image: "ghcr.io/jwilson45/mm" } } })
+  );
+  fs.writeFileSync(
+    path.join(root, "package.json"),
+    JSON.stringify({
+      scripts: {
+        "build:postgres-replication": "docker build -t ghcr.io/jwilson45/mm-postgres-replication:1.0.0",
+        "build:outlook-connector": "docker build -t ghcr.io/jwilson45/outlook-connector:latest",
+      },
+    })
+  );
+  const images = discoverFromSource(root);
+  assert.deepEqual(images, [
+    "ghcr.io/jwilson45/mm",
+    "ghcr.io/jwilson45/mm-buildcache",
+    "ghcr.io/jwilson45/mm-postgres-replication",
+    "ghcr.io/jwilson45/outlook-connector",
   ]);
 });
 
@@ -103,37 +147,26 @@ test("toImageName lowercases the owner and keeps the package name", () => {
   assert.equal(toImageName("outlook-connector", "JWilson45"), "ghcr.io/jwilson45/outlook-connector");
 });
 
-test("discoverMicromarketingImages lists public and private packages and fail-closes on 403", async () => {
-  const requested = [];
-  const github = {
-    paginate: async (fn, params) => {
-      requested.push(params.visibility);
-      return fn(params);
+test("discoverMicromarketingImages uses source even when GHCR listing returns 400", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ghcr-discover-"));
+  fs.writeFileSync(path.join(root, "package.json"), '{"scripts":{"build":"docker build -t ghcr.io/jwilson45/outlook-connector:latest"}}');
+  const failing = {
+    paginate: async () => {
+      throw Object.assign(new Error("Invalid argument."), { status: 400 });
     },
-    rest: {
-      packages: {
-        listPackagesForUser: async ({ visibility }) =>
-          micromarketingPackages.filter((pkg) =>
-            visibility === "private" ? pkg.name === "mm-buildcache" : pkg.name !== "mm-buildcache"
-          ),
-      },
-    },
+    rest: { packages: { listPackagesForUser: async () => {} } },
   };
-  const images = await discoverMicromarketingImages({ github });
-  assert.deepEqual(requested, ["public", "private"]);
+  const images = await discoverMicromarketingImages({ github: failing, sourceRoot: root });
   assert.ok(images.includes("ghcr.io/jwilson45/outlook-connector"));
   assert.ok(images.includes("ghcr.io/jwilson45/mm-buildcache"));
+});
 
-  const forbidden = Object.assign(new Error("Forbidden"), { status: 403 });
+test("discoverMicromarketingImages fail-closes on GHCR list errors when there is no source", async () => {
   const failing = {
-    paginate: async (fn, params) => fn(params),
-    rest: {
-      packages: {
-        listPackagesForUser: async () => {
-          throw forbidden;
-        },
-      },
+    paginate: async () => {
+      throw Object.assign(new Error("Forbidden"), { status: 403 });
     },
+    rest: { packages: { listPackagesForUser: async () => {} } },
   };
   await assert.rejects(
     () => discoverMicromarketingImages({ github: failing }),
