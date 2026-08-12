@@ -38,7 +38,7 @@ To create a release:
 
 - `.github/workflows/cleanup-pr-images.yaml` – Manually triggered workflow that plans removal of stale PR-tagged GHCR versions, PR-specific build caches, and untagged versions. Manual runs are preview-only unless deletion is explicitly enabled.
 
-- `.github/workflows/cleanup-pr-images-weekly.yaml` – Weekly scheduler that reads Micromarketing's CI image catalog, includes the shared build cache package, and performs the approved automatic cleanup.
+- `.github/workflows/cleanup-pr-images-weekly.yaml` – Weekly scheduler that discovers every GHCR package linked to `JWilson45/micromarketing` (including Outlook MCP and packages not in the CI catalog), reports catalog drift, and performs the approved automatic cleanup.
 
 - `.github/workflows/release.yaml` – Manages version bumps and publishes releases for this repository's reusable workflows.
 
@@ -108,17 +108,27 @@ Use *Actions -> Cleanup GHCR Images* to clean up PR images, PR-specific registry
 
 ## Weekly scheduled cleanup
 
-`cleanup-pr-images-weekly.yaml` runs every Sunday at 16:20 UTC. It reads
-`JWilson45/micromarketing`'s `.github/ci/catalog.json`, adds
-`ghcr.io/jwilson45/mm-buildcache`, and dispatches `cleanup-pr-images.yaml` with:
+`cleanup-pr-images-weekly.yaml` runs every Sunday at 16:20 UTC. It lists
+`JWilson45` container packages linked to `JWilson45/micromarketing` (Outlook
+MCP / `outlook-connector`, `mm-buildcache`, `mm-postgres-replication`, and
+every other micromarketing-built image) and dispatches
+`cleanup-pr-images.yaml` with:
 
-- `image_name`: every current CI image in the catalog plus the shared build cache (the Outlook MCP POC is not in this catalog)
+- `image_name`: every discovered micromarketing-linked GHCR package
 - `pr_numbers`: blank (all PR-tagged versions)
 - `older_than_days`: `7`
 - `pr_repository`: `JWilson45/micromarketing`
 - `protect_open_prs`: `true`
 - `execute`: `true` on schedule; a manual run of the weekly wrapper defaults to preview-only
 - `require_approval`: `false`
+
+Micromarketing's `.github/ci/catalog.json` is still checked out as a coverage
+report. Images in GHCR but not in the catalog are cleaned. Catalog images with
+no GHCR package are warned and skipped. Packages from other repositories
+(`github-runner`, `obx-conditions`) are not included.
+
+If listing user packages fails, the weekly job fails closed instead of falling
+back to the catalog list.
 
 The public `workflows` repository needs a `MICROMARKETING_PR_READ_TOKEN` secret:
 a fine-grained token limited to `JWilson45/micromarketing` with **Contents: Read**
