@@ -77,19 +77,34 @@ function coverageRows(discovered, catalogImages) {
 
 function listPackagesErrorMessage(error, username = DEFAULT_PACKAGE_OWNER) {
   const status = error?.status;
-  if (status === 403 || status === 404) {
-    return `Unable to list container packages for ${username} (HTTP ${status}). The workflow token needs permission to list user packages; failing closed instead of falling back to the CI catalog.`;
+  if (status === 400 || status === 403 || status === 404) {
+    return `Unable to list container packages for ${username} (HTTP ${status}). GitHub App tokens must list public and private packages separately and need permission to list user packages; failing closed instead of falling back to the CI catalog.`;
   }
   return error?.message || String(error);
 }
 
 async function listUserContainerPackages(github, username = DEFAULT_PACKAGE_OWNER) {
+  // GITHUB_TOKEN is a GitHub App installation token. Listing user packages
+  // without `visibility` returns HTTP 400 Invalid argument.
+  const visibilities = ["public", "private"];
+  const packages = [];
+  const seen = new Set();
   try {
-    return await github.paginate(github.rest.packages.listPackagesForUser, {
-      username,
-      package_type: "container",
-      per_page: 100,
-    });
+    for (const visibility of visibilities) {
+      const page = await github.paginate(github.rest.packages.listPackagesForUser, {
+        username,
+        package_type: "container",
+        visibility,
+        per_page: 100,
+      });
+      for (const pkg of page) {
+        const key = normalizeName(pkg?.name);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        packages.push(pkg);
+      }
+    }
+    return packages;
   } catch (error) {
     const wrapped = new Error(listPackagesErrorMessage(error, username));
     wrapped.cause = error;
