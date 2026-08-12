@@ -103,20 +103,30 @@ test("toImageName lowercases the owner and keeps the package name", () => {
   assert.equal(toImageName("outlook-connector", "JWilson45"), "ghcr.io/jwilson45/outlook-connector");
 });
 
-test("discoverMicromarketingImages paginates user packages and fail-closes on 403", async () => {
+test("discoverMicromarketingImages lists public and private packages and fail-closes on 403", async () => {
+  const requested = [];
   const github = {
-    paginate: async (fn) => fn(),
+    paginate: async (fn, params) => {
+      requested.push(params.visibility);
+      return fn(params);
+    },
     rest: {
       packages: {
-        listPackagesForUser: async () => micromarketingPackages,
+        listPackagesForUser: async ({ visibility }) =>
+          micromarketingPackages.filter((pkg) =>
+            visibility === "private" ? pkg.name === "mm-buildcache" : pkg.name !== "mm-buildcache"
+          ),
       },
     },
   };
-  assert.ok((await discoverMicromarketingImages({ github })).includes("ghcr.io/jwilson45/outlook-connector"));
+  const images = await discoverMicromarketingImages({ github });
+  assert.deepEqual(requested, ["public", "private"]);
+  assert.ok(images.includes("ghcr.io/jwilson45/outlook-connector"));
+  assert.ok(images.includes("ghcr.io/jwilson45/mm-buildcache"));
 
   const forbidden = Object.assign(new Error("Forbidden"), { status: 403 });
   const failing = {
-    paginate: async (fn) => fn(),
+    paginate: async (fn, params) => fn(params),
     rest: {
       packages: {
         listPackagesForUser: async () => {
