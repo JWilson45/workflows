@@ -11,6 +11,10 @@ inputs:
   do_deploy:
     required: true
     description: "true or false"
+  registry_cache_mode:
+    required: false
+    default: min
+    description: "none, min, or max registry cache policy for image builds"
   helm_release:
     required: false
     default: ""
@@ -54,6 +58,7 @@ runs:
         IMAGES_JSON: ${{ inputs.images_json }}
         PRODUCTS_JSON: ${{ inputs.products_json }}
         DO_DEPLOY: ${{ inputs.do_deploy }}
+        REGISTRY_CACHE_MODE: ${{ inputs.registry_cache_mode }}
         HELM_RELEASE: ${{ inputs.helm_release }}
         KUBE_NAMESPACE: ${{ inputs.kube_namespace }}
         HELM_CHART: ${{ inputs.helm_chart }}

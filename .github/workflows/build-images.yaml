@@ -36,7 +36,8 @@ on:
         required: false
         default: min
         type: string
-      # Registry cache-to mode: min is faster to export; max is better for cold runners
+      # none disables registry cache I/O; min uses fresh per-image final-stage
+      # caches; max retains legacy intermediate-stage caches.
       registry_cache_mode:
         required: false
         default: min
@@ -92,11 +93,13 @@ jobs:
       - name: Plan image builds
         id: plan
         if: inputs.use_preplanned_plan != true
-        uses: JWilson45/workflows/.github/actions/plan-images@v3.5.3
+        # Promote this tested planner pin when releasing the reusable workflow.
+        uses: JWilson45/workflows/.github/actions/plan-images@4cfc2d62889bcbc4bedd85b0cbb1c773aa542b76
         with:
           images_json: ${{ inputs.images_json }}
           products_json: ${{ inputs.products_json }}
           do_deploy: "false"
+          registry_cache_mode: ${{ inputs.registry_cache_mode }}
           helm_release: ${{ inputs.helm_release }}
           kube_namespace: ${{ inputs.kube_namespace }}
           helm_chart: ${{ inputs.helm_chart }}
@@ -120,6 +123,19 @@ jobs:
             build_matrix="$PLANNED_BUILD_MATRIX"
           fi
           jq -e 'type == "array"' <<< "$build_matrix" >/dev/null
+          case "$REGISTRY_CACHE_MODE" in
+            none)
+              # Also protects callers that pass an older preplanned matrix.
+              build_matrix="$(jq -c 'map(.cacheFrom = "" | .cacheTo = "" | .cacheMode = "none")' <<< "$build_matrix")"
+              ;;
+            min|max)
+              if ! jq -e --arg mode "$REGISTRY_CACHE_MODE" 'all(.[]; .cacheMode == null or .cacheMode == $mode)' <<< "$build_matrix" >/dev/null; then
+                echo "Preplanned image cache mode does not match registry_cache_mode=$REGISTRY_CACHE_MODE." >&2
+                exit 1
+              fi
+              ;;
+            *) echo "registry_cache_mode must be none, min, or max. Got: $REGISTRY_CACHE_MODE" >&2; exit 1 ;;
+          esac
           if [ "$(jq 'length' <<< "$build_matrix")" -gt 0 ]; then
             should_build=true
           else
@@ -239,8 +255,8 @@ jobs:
 
             def normalize_cache_to:
               map(
-                if startswith("type=registry") then
-                  (split(",") | map(select(startswith("mode=") | not)) + ["mode=\($reg_mode)"] | join(","))
+                if startswith("type=registry") and (split(",") | any(startswith("mode=")) | not) then
+                  . + ",mode=\($reg_mode)"
                 else . end
               );
 

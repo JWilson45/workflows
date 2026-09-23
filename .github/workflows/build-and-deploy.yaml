@@ -29,6 +29,10 @@ on:
         required: false
         default: linux/amd64
         type: string
+      registry_cache_mode:
+        required: false
+        default: min
+        type: string
       kube_namespace:
         required: false
         default: ""
@@ -123,11 +127,13 @@ jobs:
 
       - name: Plan image builds
         id: plan
-        uses: JWilson45/workflows/.github/actions/plan-images@v3.5.3
+        # Promote this tested planner pin when releasing the reusable workflow.
+        uses: JWilson45/workflows/.github/actions/plan-images@4cfc2d62889bcbc4bedd85b0cbb1c773aa542b76
         with:
           images_json: ${{ inputs.images_json }}
           products_json: ${{ inputs.products_json }}
           do_deploy: ${{ inputs.do_deploy }}
+          registry_cache_mode: ${{ inputs.registry_cache_mode }}
           helm_release: ${{ inputs.helm_release }}
           kube_namespace: ${{ inputs.kube_namespace }}
           helm_chart: ${{ inputs.helm_chart }}
@@ -268,11 +274,13 @@ jobs:
     steps:
       - name: Plan image builds
         id: plan
-        uses: JWilson45/workflows/.github/actions/plan-images@v3.5.3
+        # Deploy planning has no cache work; keep this pin aligned with Bake.
+        uses: JWilson45/workflows/.github/actions/plan-images@4cfc2d62889bcbc4bedd85b0cbb1c773aa542b76
         with:
           images_json: ${{ inputs.images_json }}
           products_json: ${{ inputs.products_json }}
           do_deploy: ${{ inputs.do_deploy }}
+          registry_cache_mode: none
           helm_release: ${{ inputs.helm_release }}
           kube_namespace: ${{ inputs.kube_namespace }}
           helm_chart: ${{ inputs.helm_chart }}
