@@ -5,6 +5,12 @@ images_file="$(mktemp)"
 printf '%s' "$IMAGES_JSON" > "$images_file"
 jq -e 'type == "array" and length > 0' "$images_file" >/dev/null
 
+registry_cache_mode="${REGISTRY_CACHE_MODE:-min}"
+case "$registry_cache_mode" in
+  none|min|max) ;;
+  *) echo "registry_cache_mode must be none, min, or max. Got: $registry_cache_mode" >&2; exit 1 ;;
+esac
+
 multi_product=false
 products_file="$(mktemp)"
 if [ -n "${PRODUCTS_JSON// }" ]; then
@@ -147,46 +153,58 @@ while IFS= read -r image_config; do
   if [ "$is_open_pr_context" != "true" ]; then
     tags="${tags}"$'\n'"$image:latest"
   fi
-  cache_tag="$(printf '%s' "$docker_target" | tr -c 'A-Za-z0-9_.-' '-')"
-  cache_ref="$image:buildcache-$cache_tag"
-  # Shared monorepo deps cache across image names (same Dockerfile deps stage).
-  owner_segment="$(echo "$image" | cut -d'/' -f2)"
-  shared_deps_image="${registry}/${owner_segment}/mm-buildcache"
-  shared_deps_ref="${shared_deps_image}:deps"
-  cache_from=""
-  cache_to_lines=("type=registry,ref=$cache_ref,mode=max")
-  if [ -n "$cache_pr_number" ]; then
-    pr_cache_ref="$image:buildcache-$cache_tag-pr$cache_pr_number"
-    if check_tag "$image" "buildcache-$cache_tag-pr$cache_pr_number"; then
-      cache_from="$(append_cache_from "$cache_from" "$pr_cache_ref")"
-    fi
-    if [ "$is_open_pr_context" = "true" ]; then
-      cache_to_lines=("type=registry,ref=$pr_cache_ref,mode=max")
-    fi
-  fi
-  if [ -n "$cache_pr_number" ] && check_tag "$shared_deps_image" "deps-pr${cache_pr_number}"; then
-    cache_from="$(append_cache_from "$cache_from" "${shared_deps_image}:deps-pr${cache_pr_number}")"
-  fi
-  if check_tag "$shared_deps_image" "deps"; then
-    cache_from="$(append_cache_from "$cache_from" "$shared_deps_ref")"
-  fi
-  if check_tag "$image" "buildcache-$cache_tag"; then
-    cache_from="$(append_cache_from "$cache_from" "$cache_ref")"
-  fi
   image_action="reuse"
   if ! check_tag "$image" "$image_tag"; then
     image_action="build"
-    # Only one built image writes each shared deps tag. Bake builds its targets
-    # concurrently, so multiple writers can overwrite one another's export.
-    shared_cache_to_ref="$shared_deps_ref"
-    if [ "$is_open_pr_context" = "true" ]; then
-      shared_cache_to_ref="${shared_deps_image}:deps-pr${cache_pr_number}"
+    cache_from=""
+    cache_to=""
+    if [ "$registry_cache_mode" != "none" ]; then
+      cache_tag="$(printf '%s' "$docker_target" | tr -c 'A-Za-z0-9_.-' '-')"
+      cache_prefix="buildcache-$cache_tag"
+      if [ "$registry_cache_mode" = "min" ]; then
+        # Distinct tags avoid importing large max-mode caches from older runs.
+        cache_prefix="buildcache-min-$cache_tag"
+      fi
+      cache_ref="$image:$cache_prefix"
+      cache_to_ref="$cache_ref"
+      if [ -n "$cache_pr_number" ]; then
+        pr_cache_ref="$image:$cache_prefix-pr$cache_pr_number"
+        if check_tag "$image" "$cache_prefix-pr$cache_pr_number"; then
+          cache_from="$(append_cache_from "$cache_from" "$pr_cache_ref")"
+        fi
+        if [ "$is_open_pr_context" = "true" ]; then
+          cache_to_ref="$pr_cache_ref"
+        fi
+      fi
+      if [ "$registry_cache_mode" = "max" ]; then
+        # Legacy shared cache is useful only with intermediate-stage exports.
+        owner_segment="$(echo "$image" | cut -d'/' -f2)"
+        shared_deps_image="${registry}/${owner_segment}/mm-buildcache"
+        shared_deps_ref="${shared_deps_image}:deps"
+        if [ -n "$cache_pr_number" ] && check_tag "$shared_deps_image" "deps-pr${cache_pr_number}"; then
+          cache_from="$(append_cache_from "$cache_from" "${shared_deps_image}:deps-pr${cache_pr_number}")"
+        fi
+        if check_tag "$shared_deps_image" "deps"; then
+          cache_from="$(append_cache_from "$cache_from" "$shared_deps_ref")"
+        fi
+      fi
+      if check_tag "$image" "$cache_prefix"; then
+        cache_from="$(append_cache_from "$cache_from" "$cache_ref")"
+      fi
+      cache_to_lines=("type=registry,ref=$cache_to_ref,mode=$registry_cache_mode")
+      if [ "$registry_cache_mode" = "max" ]; then
+        # Bake builds targets concurrently; one writer owns each shared tag.
+        shared_cache_to_ref="$shared_deps_ref"
+        if [ "$is_open_pr_context" = "true" ]; then
+          shared_cache_to_ref="${shared_deps_image}:deps-pr${cache_pr_number}"
+        fi
+        if [[ "$shared_cache_exported" != *$'\n'"$shared_cache_to_ref"$'\n'* ]]; then
+          cache_to_lines+=("type=registry,ref=${shared_cache_to_ref},mode=max")
+          shared_cache_exported="${shared_cache_exported}${shared_cache_to_ref}"$'\n'
+        fi
+      fi
+      cache_to="$(printf '%s\n' "${cache_to_lines[@]}")"
     fi
-    if [[ "$shared_cache_exported" != *$'\n'"$shared_cache_to_ref"$'\n'* ]]; then
-      cache_to_lines+=("type=registry,ref=${shared_cache_to_ref},mode=max")
-      shared_cache_exported="${shared_cache_exported}${shared_cache_to_ref}"$'\n'
-    fi
-    cache_to="$(printf '%s\n' "${cache_to_lines[@]}")"
     matrix_item="$(jq -cn \
       --arg name "$name" \
       --arg image "$image" \
@@ -197,7 +215,8 @@ while IFS= read -r image_config; do
       --arg tags "$tags" \
       --arg cacheFrom "$cache_from" \
       --arg cacheTo "$cache_to" \
-      '{name:$name,image:$image,registry:$registry,dockerTarget:$dockerTarget,dockerContext:$dockerContext,dockerfile:$dockerfile,tags:$tags,cacheFrom:$cacheFrom,cacheTo:$cacheTo}')"
+      --arg cacheMode "$registry_cache_mode" \
+      '{name:$name,image:$image,registry:$registry,dockerTarget:$dockerTarget,dockerContext:$dockerContext,dockerfile:$dockerfile,tags:$tags,cacheFrom:$cacheFrom,cacheTo:$cacheTo,cacheMode:$cacheMode}')"
     build_matrix="$(jq -c --argjson item "$matrix_item" '. + [$item]' <<< "$build_matrix")"
   fi
 
