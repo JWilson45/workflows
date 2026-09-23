@@ -93,7 +93,8 @@ jobs:
       - name: Plan image builds
         id: plan
         if: inputs.use_preplanned_plan != true
-        uses: JWilson45/workflows/.github/actions/plan-images@v3.5.3
+        # Promote this tested planner pin when releasing the reusable workflow.
+        uses: JWilson45/workflows/.github/actions/plan-images@9e830daa2fc525ea60c86000febb0d675788ead6
         with:
           images_json: ${{ inputs.images_json }}
           products_json: ${{ inputs.products_json }}

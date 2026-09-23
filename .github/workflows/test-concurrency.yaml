@@ -1,4 +1,4 @@
-name: Test Workflow Concurrency
+name: Test Workflow Contracts
 on:
   pull_request:
     paths:
@@ -6,6 +6,7 @@ on:
       - '.github/workflows/deploy-products.yaml'
       - '.github/workflows/build-and-deploy.yaml'
       - '.github/workflows/test-concurrency.yaml'
+      - '.github/actions/plan-images/**'
       - '.github/scripts/workflow-contracts/**'
 permissions:
   contents: read
@@ -17,4 +18,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Check jq prerequisite
+        run: jq --version
       - run: node --test .github/scripts/workflow-contracts/*.test.js
+      - run: python3 .github/scripts/workflow-contracts/test_cache_plan.py -v

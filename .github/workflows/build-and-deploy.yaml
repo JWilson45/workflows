@@ -123,7 +123,8 @@ jobs:
 
       - name: Plan image builds
         id: plan
-        uses: JWilson45/workflows/.github/actions/plan-images@v3.5.3
+        # Promote this tested planner pin when releasing the reusable workflow.
+        uses: JWilson45/workflows/.github/actions/plan-images@9e830daa2fc525ea60c86000febb0d675788ead6
         with:
           images_json: ${{ inputs.images_json }}
           products_json: ${{ inputs.products_json }}
@@ -268,7 +269,8 @@ jobs:
     steps:
       - name: Plan image builds
         id: plan
-        uses: JWilson45/workflows/.github/actions/plan-images@v3.5.3
+        # Keep this pin aligned with the Bake planner during release.
+        uses: JWilson45/workflows/.github/actions/plan-images@9e830daa2fc525ea60c86000febb0d675788ead6
         with:
           images_json: ${{ inputs.images_json }}
           products_json: ${{ inputs.products_json }}
