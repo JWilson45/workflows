@@ -136,3 +136,21 @@ The public `workflows` repository needs a `MICROMARKETING_PR_READ_TOKEN` secret:
 a fine-grained token limited to `JWilson45/micromarketing` with **Contents: Read**
 and **Pull requests: Read**. It is used only to read the private CI catalog and
 PR state; package listing and deletion continue to use the workflow token.
+
+## Build and deployment concurrency
+
+The build, deployment, and combined workflows accept optional `concurrency_scope`
+(default `default`). Pass the target environment to prevent two manual releases
+for different environments from cancelling one another. Groups also distinguish
+event type, ref, Helm release (or `multi`), and build versus deployment stage.
+Newer runs in the same group still cancel older runs. Callers should use the same
+environment separation in their own workflow-level concurrency policy.
+
+```yaml
+with:
+  concurrency_scope: ${{ needs.plan.outputs.environment }}
+```
+
+This prevents automatic `main` builds from cancelling manual production builds.
+It does not provide deployment ordering: promote dependent workers and apps
+sequentially and verify each rollout.

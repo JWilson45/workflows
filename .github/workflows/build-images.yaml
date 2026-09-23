@@ -7,6 +7,11 @@ name: Build Images
 on:
   workflow_call:
     inputs:
+      concurrency_scope:
+        description: Cancellation scope within an event/ref, such as the target environment
+        required: false
+        default: "default"
+        type: string
       images_json:
         required: true
         type: string
@@ -68,7 +73,7 @@ jobs:
     runs-on: ${{ inputs.build_runner_label }}
     timeout-minutes: 60
     concurrency:
-      group: ${{ github.workflow }}-${{ inputs.helm_release != '' && inputs.helm_release || 'multi' }}-bake-${{ github.ref }}
+      group: ${{ github.workflow }}-${{ github.event_name }}-${{ inputs.concurrency_scope }}-${{ inputs.helm_release != '' && inputs.helm_release || 'multi' }}-bake-${{ github.ref }}
       cancel-in-progress: true
     permissions:
       contents: read
