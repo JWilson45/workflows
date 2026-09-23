@@ -36,7 +36,8 @@ on:
         required: false
         default: min
         type: string
-      # Registry cache-to mode: min is faster to export; max is better for cold runners
+      # Fallback mode for cache destinations without an explicit mode in the plan.
+      # The image planner selects max to preserve intermediate Docker stages.
       registry_cache_mode:
         required: false
         default: min
@@ -239,8 +240,8 @@ jobs:
 
             def normalize_cache_to:
               map(
-                if startswith("type=registry") then
-                  (split(",") | map(select(startswith("mode=") | not)) + ["mode=\($reg_mode)"] | join(","))
+                if startswith("type=registry") and (split(",") | any(startswith("mode=")) | not) then
+                  . + ",mode=\($reg_mode)"
                 else . end
               );
 

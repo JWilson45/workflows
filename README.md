@@ -22,7 +22,8 @@ To create a release:
 
 - `.github/workflows/build-images.yaml` – **Single job (Bake):** plan tags + `docker buildx bake` for one or more images. Prefer this for monorepo CI build stages.
   - Defaults to `linux/amd64`
-  - Inputs `attest_mode` (`min`|`max`|`none`) and `registry_cache_mode` (`min`|`max`)
+  - Inputs `attest_mode` (`min`|`max`|`none`) and `registry_cache_mode` (`min`|`max`, fallback for cache destinations without an explicit mode)
+  - The image plan exports each image cache with `mode=max` for intermediate stages and gives one built image ownership of each shared deps cache tag. PR cache tags remain separate from the baseline tags.
   - **Registry cache only** (no local/type=local cache — ephemeral runners discard disk after the job)
   - Bake runs with `--progress=plain` for per-stage timings in logs
 

@@ -43,6 +43,7 @@ build_matrix='[]'
 image_plan='[]'
 image_meta='{}'
 helm_set_args=''
+shared_cache_exported=$'\n'
 
 # Reuse one pull token per registry repo across check_tag calls (avoids
 # anonymous GHCR token minting + rate limits on multi-image plans).
@@ -161,12 +162,7 @@ while IFS= read -r image_config; do
     fi
     if [ "$is_open_pr_context" = "true" ]; then
       cache_to_lines=("type=registry,ref=$pr_cache_ref,mode=max")
-      cache_to_lines+=("type=registry,ref=${shared_deps_image}:deps-pr${cache_pr_number},mode=max")
-    else
-      cache_to_lines+=("type=registry,ref=${shared_deps_ref},mode=max")
     fi
-  else
-    cache_to_lines+=("type=registry,ref=${shared_deps_ref},mode=max")
   fi
   if [ -n "$cache_pr_number" ] && check_tag "$shared_deps_image" "deps-pr${cache_pr_number}"; then
     cache_from="$(append_cache_from "$cache_from" "${shared_deps_image}:deps-pr${cache_pr_number}")"
@@ -177,11 +173,20 @@ while IFS= read -r image_config; do
   if check_tag "$image" "buildcache-$cache_tag"; then
     cache_from="$(append_cache_from "$cache_from" "$cache_ref")"
   fi
-  cache_to="$(printf '%s\n' "${cache_to_lines[@]}")"
-
   image_action="reuse"
   if ! check_tag "$image" "$image_tag"; then
     image_action="build"
+    # Only one built image writes each shared deps tag. Bake builds its targets
+    # concurrently, so multiple writers can overwrite one another's export.
+    shared_cache_to_ref="$shared_deps_ref"
+    if [ "$is_open_pr_context" = "true" ]; then
+      shared_cache_to_ref="${shared_deps_image}:deps-pr${cache_pr_number}"
+    fi
+    if [[ "$shared_cache_exported" != *$'\n'"$shared_cache_to_ref"$'\n'* ]]; then
+      cache_to_lines+=("type=registry,ref=${shared_cache_to_ref},mode=max")
+      shared_cache_exported="${shared_cache_exported}${shared_cache_to_ref}"$'\n'
+    fi
+    cache_to="$(printf '%s\n' "${cache_to_lines[@]}")"
     matrix_item="$(jq -cn \
       --arg name "$name" \
       --arg image "$image" \
